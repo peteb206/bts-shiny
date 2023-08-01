@@ -1,0 +1,6 @@
+dnspython==2.4.1
+pandas==2.0.3
+pymongo==3.12.0
+pymongoarrow==1.0.2
+requests==2.31.0
+shiny==0.2.9
