@@ -14,6 +14,11 @@ __SESSION__.headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
     'X-Requested-With': 'XMLHttpRequest'
 }
+def get(url: str) -> requests.Response:
+    print('GET', url if len(url) <= 100 else f'{url[:97]}...', end = '')
+    req = __SESSION__.get(url, timeout = None)
+    print(f' ({req.status_code}) {round(req.elapsed.total_seconds(), 2)}s')
+    return req
 
 # MongoDB
 if path.isfile('.env'):
@@ -29,36 +34,22 @@ def month_start_and_end(year: int = None, month: int = None) -> (date, date):
 def date_to_datetime(date: date) -> datetime:
     return datetime.combine(date, datetime.min.time())
 
-def db_stats():
-    return list(__DB__.atBats.aggregate([
-        {
-            '$group': {
-                '_id': None,
-                'min': {'$min': '$game_date'},
-                'max': {'$max': '$game_date'},
-                'count': {'$sum': 1}
-            }
-        }, {
-            '$unset': '_id'
-        }
-    ]))[0]
-
 class MLBData:
 
     @staticmethod
-    def get_stats_api_games(year = 2023, date: date = None):
-        url = 'https://statsapi.mlb.com/api/v1/schedule?lang=en&sportId=1&gameType=R' \
-            + (f'&season={year}' if date == None else f'&date={date.strftime("%Y-%m-%d")}') \
-            + '&hydrate=team,probablePitcher,lineups' #,weather,linescore'
-        req = __SESSION__.get(url)
-
+    def get_stats_api_games(year: int = None, date: date = None):
+        req = get(
+            'https://statsapi.mlb.com/api/v1/schedule?lang=en&sportId=1&gameType=R' \
+                + (f'&season={year}' if date == None else f'&date={date.strftime("%Y-%m-%d")}') \
+                + '&hydrate=team,probablePitcher,lineups' #,weather,linescore'
+        )
         games_list = list()
         for game_date in json.loads(req.text)['dates']:
             for game in game_date['games']:
                 utc_hour, minute = int(game['gameDate'].split('T')[1].split(':')[0]), int(game['gameDate'].split('T')[1].split(':')[1])
                 hour = utc_hour - 5 if utc_hour > 5 else utc_hour + 19
                 games_list.append({
-                    # 'year': datetime.strptime(game_date['date'], '%Y-%m-%d').year,
+                    'year': year,
                     'game_date': game_date['date'],
                     'game_time': f'{hour if hour < 13 else hour - 12}:{"0" if minute < 10 else ""}{minute} {"PM" if hour > 11 else "AM"}',
                     'game_pk': game['gamePk'],
@@ -76,16 +67,16 @@ class MLBData:
         return pd.DataFrame(games_list)
 
     @staticmethod
-    def get_stats_api_players(year = 2023):
-        req = __SESSION__.get(f'https://statsapi.mlb.com/api/v1/sports/1/players?lang=en&sportId=1&season={year}')
+    def get_stats_api_players(year: int = None):
+        req = get(f'https://statsapi.mlb.com/api/v1/sports/1/players?lang=en&sportId=1&season={year}')
         people = json.loads(req.text)['people']
         player_df = pd.DataFrame(people)
         player_df['year'] = year
         player_df['position'] = player_df['primaryPosition'].apply(lambda x: x['abbreviation'])
         player_df['throws'] = player_df['pitchHand'].apply(lambda x: x['code'])
         player_df['bats'] = player_df['batSide'].apply(lambda x: x['code'])
-        player_df['team_id'] = player_df['currentTeam'].apply(lambda x: x['id'])
-        return player_df[['year', 'id', 'fullName', 'position', 'throws', 'bats', 'active', 'team_id']]
+        # player_df['team_id'] = player_df['currentTeam'].apply(lambda x: x['id'])
+        return player_df[['year', 'id', 'fullName', 'position', 'throws', 'bats', 'active']]
 
 class StatcastData:
     __AT_BAT_FINAL_EVENTS__ = [
@@ -94,65 +85,78 @@ class StatcastData:
         'intent_walk', 'sac_bunt', 'sac_bunt_double_play', 'sac_fly', 'sac_fly_double_play', 'triple_play'
     ]
 
-    def __init__(self, year: int = None, month: int = None, start_date: date = None, end_date: date = None):
-        if (start_date != None) & (end_date != None):
-            # At bats for a specific date range
-            self.__df__ = self.get_at_bats_from_db(start_date = start_date, end_date = end_date)
-        elif year != None:
-            if month != None:
-                # At bats for a specific month of one season
-                self.__df__ = self.get_at_bats_from_db(*month_start_and_end(year = year, month = month))
-            else:
-                # At bats for a specific season
-                self.__df__ = self.get_at_bats_from_db(
-                    start_date = date(year = year, month = 3, day = 1),
-                    end_date = date(year = year, month = 10, day = 31)
-                )
-        else:
-            raise Exception('Improper parameters to initialize StatcastData')
+    def __init__(self):
+        self.__df__ = self.get_at_bats_from_db()
 
-        # Replace missing xBA values with average for that event
+        # Replace missing xBA values with median for that event
         self.__df__ = self.__df__ \
             .merge(self.__df__.groupby('game_pk')['xBA'].sum().reset_index(), how = 'left', on = 'game_pk', suffixes = ['', '_game_sum']) \
             .merge(self.__df__.groupby('events')['xBA'].median().reset_index(), how = 'left', on = 'events', suffixes = ['', '_med']) \
             .fillna({'xBA_game_sum': 0, 'xBA_med': 0})
         self.__df__['xBA'] = self.__df__.apply(lambda row: row['xBA_med'] if row['xBA_game_sum'] == 0 else row['xBA'], axis = 1)
-        self.__df__['hit'] = (self.__df__['events'] < 4).astype(int)
-        self.__df__['bip'] = (self.__df__['xBA_med'] > 0).astype(int)
+        self.__df__['H'] = self.__df__['events'] < 4
+        self.__df__['BIP'] = self.__df__['xBA_med'] > 0
         self.__df__.drop(['events', 'xBA_med', 'xBA_game_sum'], axis = 1, inplace = True)
 
     def df(self):
-        return self.__df__
+        return self.__df__.copy()
 
     @staticmethod
-    def get_at_bats_from_db(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)) -> pd.DataFrame:
-        return find_pandas_all(
-            __DB__.atBats,
-            {'$and': [{'game_date': {'$gte': date_to_datetime(start_date)}}, {'game_date': {'$lte': date_to_datetime(end_date)}}]},
-            projection = {'_id': False}
-        )
+    def get_at_bats_from_db(query: dict = dict()) -> pd.DataFrame:
+        return find_pandas_all(__DB__.atBats, query, projection = {'_id': False})
 
     @staticmethod
     def update_db(year: int):
-        StatcastData.add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
+        # At Bats
+        new_at_bat_df: pd.DataFrame = StatcastData \
+            .add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
+        # Sprint Speeds
         StatcastData.add_season_sprint_speeds_to_db(year)
+        # Game Dates
+        game_pks = new_at_bat_df['game_pk'].unique().tolist()
+        games_df = MLBData.get_stats_api_games(year)
+        print('-' * 50)
+        new_game_dates_df = new_at_bat_df[['game_date', 'game_pk']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
+        print(f'Deleted {"{:,}".format(__DB__.gameDates.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} game dates')
+        __DB__.gameDates.insert_many(new_game_dates_df.to_dict('records'))
+        print('Added', '{:,}'.format(len(new_game_dates_df.index)), 'game dates')
+        # Lineup Slots
+        print('-' * 50)
+        new_at_bat_df = new_at_bat_df.merge(games_df.drop('game_date', axis = 1), how = 'left', on = 'game_pk')
+        new_at_bat_df['lineup'] = new_at_bat_df.apply(lambda row: row['home_lineup'] if row['home'] else row['away_lineup'], axis = 1)
+        new_at_bat_df['lineup'] = new_at_bat_df \
+            .apply(lambda row: row['lineup'].index(row['batter']) + 1 if row['batter'] in row['lineup'] else 10, axis = 1)
+        new_lineups_df = new_at_bat_df[['game_pk', 'home', 'lineup', 'batter']].dropna().drop_duplicates() \
+            .sort_values(by = ['game_pk', 'home', 'lineup'])
+        print(f'Deleted {"{:,}".format(__DB__.lineupSlots.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} lineup slots')
+        __DB__.lineupSlots.insert_many(new_lineups_df.to_dict('records'))
+        print('Added', '{:,}'.format(len(new_lineups_df.index)), 'lineup slots')
+        # Starting Pitchers
+        print('-' * 50)
+        new_at_bat_df['primary_pitcher'] = new_at_bat_df.apply(lambda row: row['pitcher'] in [row['away_starter'], row['home_starter']], axis = 1)
+        new_starting_pitchers_df = new_at_bat_df[new_at_bat_df['primary_pitcher']][['game_pk', 'home', 'pitcher']].dropna().drop_duplicates() \
+            .sort_values(by = ['game_pk', 'home'])
+        print(f'Deleted {"{:,}".format(__DB__.opposingStartingPitchers.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} starting pitchers')
+        __DB__.opposingStartingPitchers.insert_many(new_starting_pitchers_df.to_dict('records'))
+        print('Added', '{:,}'.format(len(new_starting_pitchers_df.index)), 'starting pitchers')
+        print('-' * 80)
 
     @staticmethod
-    def add_at_bats_to_db(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)):
+    def add_at_bats_to_db(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)) -> pd.DataFrame:
         end_date = min(end_date, date.today() - timedelta(days = 1))
         print('-' * 80)
         print('Adding/Updating at bats from', start_date.strftime('%Y-%m-%d'), 'to', end_date.strftime('%Y-%m-%d'))
         new_at_bat_df = StatcastData.get_statcast_csv(start_date = start_date, end_date = end_date)
         # Delete existing entries
-        deleted_count = __DB__.atBats \
-            .delete_many({'$and': [{'game_date': {'$gte': date_to_datetime(start_date)}}, {'game_date': {'$lte': date_to_datetime(end_date)}}]}) \
-            .deleted_count
+        deleted_count = __DB__.atBats.delete_many({'game_pk': {'$in': new_at_bat_df['game_pk'].unique().tolist()}}).deleted_count
         print('Deleted', '{:,}'.format(deleted_count), 'at bats')
         # Add new entries
         new_at_bat_df['game_date'] = new_at_bat_df['game_date'].apply(lambda x: date_to_datetime(x))
-        __DB__.atBats.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_at_bat_df.to_dict('records')])
+        __DB__.atBats.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_at_bat_df.drop(['game_date', 'home'], axis = 1) \
+                                   .to_dict('records')])
         print('Added', '{:,}'.format(len(new_at_bat_df.index)), 'at bats')
         print('-' * 80)
+        return new_at_bat_df
 
     @staticmethod
     def get_statcast_csv(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)) -> pd.DataFrame:
@@ -183,18 +187,18 @@ class StatcastData:
             url = f'https://baseballsavant.mlb.com/statcast_search/csv?{"".join([f"{k}={v}&" for k, v in url_params.items()])}'
 
             # Convert CSV to dataframe and filter to wanted columns
-            df2, attempt = pd.DataFrame(columns = cols), 1
+            df2, baseball_savant_response, attempt = pd.DataFrame(columns = cols), None, 1
             while (len(df2.index) == 0) & (attempt <= 2):
                 try:
-                    baseball_savant_response = __SESSION__.get(url, timeout = None)
+                    baseball_savant_response = get(url)
                     df2 = pd.read_csv(io.StringIO(baseball_savant_response.content.decode('utf-8')), usecols = cols, engine = 'pyarrow')
                 except:
                     if attempt == 1:
-                        print('   Retrying...')
+                        print('Retrying...')
                         attempt += 1
                     else:
                         raise Exception(f'Unsuccessful reading of Statcast CSV\n\nResponse from Baseball Savant:\n{baseball_savant_response.text}')
-            print('   {:,}'.format(len(df2.index)), 'total at bats')
+            print('{:,}'.format(len(df2.index)), 'total at bats')
             df = pd.concat([df, df2], ignore_index = True)
         print('-' * 50)
         df['home'] = df['inning_topbot'] == 'Bot'
@@ -222,7 +226,7 @@ class StatcastData:
     @staticmethod
     def get_sprint_speed_csv(year = 2023) -> pd.DataFrame:
         url = f'https://baseballsavant.mlb.com/leaderboard/sprint_speed?min_season={year}&max_season={year}&position=&team=&min=0&csv=true'
-        baseball_savant_response = __SESSION__.get(url, timeout = None)
+        baseball_savant_response = get(url)
         df = pd.read_csv(io.StringIO(baseball_savant_response.content.decode('utf-8')), usecols = ['player_id', 'hp_to_1b', 'sprint_speed'])
         df['year'] = year
         return df.rename({'player_id': 'batter', 'sprint_speed': 'speed'}, axis = 1)
