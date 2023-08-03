@@ -86,35 +86,50 @@ class StatcastData:
     ]
 
     def __init__(self):
-        self.__df__ = self.get_at_bats_from_db()
+        at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, dict(), projection = {'_id': False})
 
         # Replace missing xBA values with median for that event
-        self.__df__ = self.__df__ \
-            .merge(self.__df__.groupby('game_pk')['xBA'].sum().reset_index(), how = 'left', on = 'game_pk', suffixes = ['', '_game_sum']) \
-            .merge(self.__df__.groupby('events')['xBA'].median().reset_index(), how = 'left', on = 'events', suffixes = ['', '_med']) \
+        at_bats_df = at_bats_df \
+            .merge(at_bats_df.groupby('game_pk')['xBA'].sum().reset_index(), how = 'left', on = 'game_pk', suffixes = ['', '_game_sum']) \
+            .merge(at_bats_df.groupby('events')['xBA'].median().reset_index(), how = 'left', on = 'events', suffixes = ['', '_med']) \
             .fillna({'xBA_game_sum': 0, 'xBA_med': 0})
-        self.__df__['xBA'] = self.__df__.apply(lambda row: row['xBA_med'] if row['xBA_game_sum'] == 0 else row['xBA'], axis = 1)
-        self.__df__['H'] = self.__df__['events'] < 4
-        self.__df__['BIP'] = self.__df__['xBA_med'] > 0
-        self.__df__.drop(['events', 'xBA_med', 'xBA_game_sum'], axis = 1, inplace = True)
+        at_bats_df['xBA'] = at_bats_df.apply(lambda row: row['xBA_med'] if row['xBA_game_sum'] == 0 else row['xBA'], axis = 1)
+        at_bats_df['H'] = at_bats_df['events'] < 4
+        at_bats_df['BIP'] = at_bats_df['xBA_med'] > 0
+        at_bats_df.drop(['events', 'xBA_med', 'xBA_game_sum'], axis = 1, inplace = True)
+
+        # Combine with other collections
+        ## At bat level
+        starting_pitchers_df: pd.DataFrame = find_pandas_all(__DB__.startingPitchers, dict(), projection = {'_id': False})
+        # TODO: fix duplicate game_pks in startingPitchers
+        at_bats_df = at_bats_df.merge(starting_pitchers_df, how = 'left', on = 'game_pk')
+        at_bats_df['primary_pitcher'] = at_bats_df.apply(lambda row: row['pitcher'] in [row['away'], row['home']], axis = 1)
+        self.__at_bats_df__ = at_bats_df.drop(['away', 'home'], axis = 1)
+
+        ## Game level
+        game_dates_df: pd.DataFrame = find_pandas_all(__DB__.gameDates, dict(), projection = {'_id': False})
+        game_dates_df['year'] = game_dates_df['game_date'].apply(lambda x: x.year)
+        lineup_slots_df: pd.DataFrame = find_pandas_all(__DB__.lineupSlots, dict(), projection = {'_id': False})
+        lineup_slots_df = lineup_slots_df.melt(id_vars = ['game_pk', 'slot'], value_vars = ['away', 'home'], var_name = 'home', value_name = 'batter')
+        lineup_slots_df['home'] = lineup_slots_df['home'] == 'home'
+        sprint_speeds_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, dict(), projection = {'_id': False})
+        self.__batter_games_df__ = self.batter_game_agg() \
+            .merge(game_dates_df, how = 'left', on = 'game_pk') \
+            .merge(lineup_slots_df, how = 'left', on = ['game_pk', 'batter']) \
+            .merge(sprint_speeds_df, how = 'left', on = ['batter', 'year'])
+        print()
 
     def df(self):
         return self.__df__.copy()
 
     @staticmethod
-    def get_at_bats_from_db(query: dict = dict()) -> pd.DataFrame:
-        return find_pandas_all(__DB__.atBats, query, projection = {'_id': False})
-
-    @staticmethod
     def update_db(year: int):
         # At Bats
-        new_at_bat_df: pd.DataFrame = StatcastData \
-            .add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
+        new_at_bat_df = StatcastData.add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
         # Sprint Speeds
         StatcastData.add_season_sprint_speeds_to_db(year)
         # Game Dates
         game_pks = new_at_bat_df['game_pk'].unique().tolist()
-        games_df = MLBData.get_stats_api_games(year)
         print('-' * 50)
         new_game_dates_df = new_at_bat_df[['game_date', 'game_pk']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
         print(f'Deleted {"{:,}".format(__DB__.gameDates.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} game dates')
@@ -122,23 +137,24 @@ class StatcastData:
         print('Added', '{:,}'.format(len(new_game_dates_df.index)), 'game dates')
         # Lineup Slots
         print('-' * 50)
-        new_at_bat_df = new_at_bat_df.merge(games_df.drop('game_date', axis = 1), how = 'left', on = 'game_pk')
-        new_at_bat_df['lineup'] = new_at_bat_df.apply(lambda row: row['home_lineup'] if row['home'] else row['away_lineup'], axis = 1)
-        new_at_bat_df['lineup'] = new_at_bat_df \
-            .apply(lambda row: row['lineup'].index(row['batter']) + 1 if row['batter'] in row['lineup'] else 10, axis = 1)
-        new_lineups_df = new_at_bat_df[['game_pk', 'home', 'lineup', 'batter']].dropna().drop_duplicates() \
-            .sort_values(by = ['game_pk', 'home', 'lineup'])
+        games_df = MLBData.get_stats_api_games(year)
+        lineups_df =  games_df[(games_df['away_lineup'].apply(lambda x: len(x) != 0)) & (games_df['home_lineup'].apply(lambda x: len(x) != 0))] \
+            [['game_pk', 'away_lineup', 'home_lineup']] \
+            .explode(['away_lineup', 'home_lineup'], ignore_index = True) \
+            .drop_duplicates()
+        lineups_df['slot'] = lineups_df.groupby('game_pk').cumcount() + 1
+        lineups_df.rename({'away_lineup': 'away', 'home_lineup': 'home'}, axis = 1, inplace = True)
         print(f'Deleted {"{:,}".format(__DB__.lineupSlots.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} lineup slots')
-        __DB__.lineupSlots.insert_many(new_lineups_df.to_dict('records'))
-        print('Added', '{:,}'.format(len(new_lineups_df.index)), 'lineup slots')
+        __DB__.lineupSlots.insert_many(lineups_df.to_dict('records'))
+        print('Added', '{:,}'.format(len(lineups_df.index)), 'lineup slots')
         # Starting Pitchers
         print('-' * 50)
-        new_at_bat_df['primary_pitcher'] = new_at_bat_df.apply(lambda row: row['pitcher'] in [row['away_starter'], row['home_starter']], axis = 1)
-        new_starting_pitchers_df = new_at_bat_df[new_at_bat_df['primary_pitcher']][['game_pk', 'home', 'pitcher']].dropna().drop_duplicates() \
-            .sort_values(by = ['game_pk', 'home'])
-        print(f'Deleted {"{:,}".format(__DB__.opposingStartingPitchers.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} starting pitchers')
-        __DB__.opposingStartingPitchers.insert_many(new_starting_pitchers_df.to_dict('records'))
-        print('Added', '{:,}'.format(len(new_starting_pitchers_df.index)), 'starting pitchers')
+        starting_pitchers_df =  games_df[['game_pk', 'away_starter', 'home_starter']].explode(['away_starter', 'home_starter'], ignore_index = True) \
+            .drop_duplicates()
+        starting_pitchers_df.rename({'away_starter': 'away', 'home_starter': 'home'}, axis = 1, inplace = True)
+        print(f'Deleted {"{:,}".format(__DB__.startingPitchers.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} starting pitchers')
+        __DB__.startingPitchers.insert_many(starting_pitchers_df.to_dict('records'))
+        print('Added', '{:,}'.format(len(starting_pitchers_df.index)), 'starting pitchers')
         print('-' * 80)
 
     @staticmethod
@@ -232,7 +248,7 @@ class StatcastData:
         return df.rename({'player_id': 'batter', 'sprint_speed': 'speed'}, axis = 1)
 
     def batter_game_agg(self) -> pd.DataFrame:
-        df = self.__df__.copy()
+        df = self.__at_bats_df__.copy()
         df['pa'] = 1
         agg_df = df.groupby(['game_date', 'game_pk', 'home', 'batter'])[['pa', 'xBA', 'hit', 'bip']].sum()
         agg_df['G'] = 1
@@ -261,3 +277,6 @@ class StatcastData:
         self.__df__['lineup'] = self.__df__ \
             .apply(lambda row: row['lineup'].index(row['batter']) + 1 if row['batter'] in row['lineup'] else 10, axis = 1)
         self.__df__.drop(['away_starter', 'home_starter', 'away_lineup', 'home_lineup'], axis = 1, inplace = True)
+
+if __name__ == '__main__':
+    statcast_data = StatcastData()
