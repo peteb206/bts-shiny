@@ -49,7 +49,7 @@ class MLBData:
                 utc_hour, minute = int(game['gameDate'].split('T')[1].split(':')[0]), int(game['gameDate'].split('T')[1].split(':')[1])
                 hour = utc_hour - 5 if utc_hour > 5 else utc_hour + 19
                 games_list.append({
-                    'year': year,
+                    'year': game['season'],
                     'game_date': game_date['date'],
                     'game_time': f'{hour if hour < 13 else hour - 12}:{"0" if minute < 10 else ""}{minute} {"PM" if hour > 11 else "AM"}',
                     'game_pk': game['gamePk'],
@@ -57,12 +57,13 @@ class MLBData:
                     # 'home_team_id': game['teams']['home']['team']['id'],
                     'away_team': game['teams']['away']['team']['abbreviation'],
                     'home_team': game['teams']['home']['team']['abbreviation'],
-                    'away_starter': game['teams']['away']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['away'].keys() else 0,
-                    'home_starter': game['teams']['home']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['home'].keys() else 0,
+                    'away_starter': game['teams']['away']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['away'].keys() else None,
+                    'home_starter': game['teams']['home']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['home'].keys() else None,
                     'away_lineup': ([x['id'] for x in game['lineups']['awayPlayers']] if 'awayPlayers' in game['lineups'].keys() else []) \
                         if 'lineups' in game.keys() else [],
                     'home_lineup': ([x['id'] for x in game['lineups']['homePlayers']] if 'homePlayers' in game['lineups'].keys() else []) \
-                        if 'lineups' in game.keys() else []
+                        if 'lineups' in game.keys() else [],
+                    'status': game['status']['detailedState']
                 })
         return pd.DataFrame(games_list)
 
@@ -101,10 +102,10 @@ class StatcastData:
         # Combine with other collections
         ## At bat level
         starting_pitchers_df: pd.DataFrame = find_pandas_all(__DB__.startingPitchers, dict(), projection = {'_id': False})
-        # TODO: fix duplicate game_pks in startingPitchers
-        at_bats_df = at_bats_df.merge(starting_pitchers_df, how = 'left', on = 'game_pk')
-        at_bats_df['primary_pitcher'] = at_bats_df.apply(lambda row: row['pitcher'] in [row['away'], row['home']], axis = 1)
-        self.__at_bats_df__ = at_bats_df.drop(['away', 'home'], axis = 1)
+        self.__at_bats_df__ = at_bats_df.merge(starting_pitchers_df, how = 'left', on = 'game_pk')
+        assert len(self.__at_bats_df__.index) == len(at_bats_df.index)
+        self.__at_bats_df__['primary_pitcher'] = self.__at_bats_df__.apply(lambda row: row['pitcher'] in [row['away'], row['home']], axis = 1)
+        self.__at_bats_df__.drop(['away', 'home'], axis = 1, inplace = True)
 
         ## Game level
         game_dates_df: pd.DataFrame = find_pandas_all(__DB__.gameDates, dict(), projection = {'_id': False})
@@ -113,11 +114,12 @@ class StatcastData:
         lineup_slots_df = lineup_slots_df.melt(id_vars = ['game_pk', 'slot'], value_vars = ['away', 'home'], var_name = 'home', value_name = 'batter')
         lineup_slots_df['home'] = lineup_slots_df['home'] == 'home'
         sprint_speeds_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, dict(), projection = {'_id': False})
-        self.__batter_games_df__ = self.batter_game_agg() \
+        batter_game_agg_df = self.batter_game_agg()
+        self.__batter_games_df__ = batter_game_agg_df \
             .merge(game_dates_df, how = 'left', on = 'game_pk') \
             .merge(lineup_slots_df, how = 'left', on = ['game_pk', 'batter']) \
             .merge(sprint_speeds_df, how = 'left', on = ['batter', 'year'])
-        print()
+        assert len(self.__batter_games_df__.index) == len(batter_game_agg_df.index)
 
     def df(self):
         return self.__df__.copy()
@@ -138,6 +140,7 @@ class StatcastData:
         # Lineup Slots
         print('-' * 50)
         games_df = MLBData.get_stats_api_games(year)
+        games_df = games_df[games_df['status'] == 'Final']
         lineups_df =  games_df[(games_df['away_lineup'].apply(lambda x: len(x) != 0)) & (games_df['home_lineup'].apply(lambda x: len(x) != 0))] \
             [['game_pk', 'away_lineup', 'home_lineup']] \
             .explode(['away_lineup', 'home_lineup'], ignore_index = True) \
@@ -149,7 +152,7 @@ class StatcastData:
         print('Added', '{:,}'.format(len(lineups_df.index)), 'lineup slots')
         # Starting Pitchers
         print('-' * 50)
-        starting_pitchers_df =  games_df[['game_pk', 'away_starter', 'home_starter']].explode(['away_starter', 'home_starter'], ignore_index = True) \
+        starting_pitchers_df = games_df[['game_pk', 'away_starter', 'home_starter']].explode(['away_starter', 'home_starter'], ignore_index = True) \
             .drop_duplicates()
         starting_pitchers_df.rename({'away_starter': 'away', 'home_starter': 'home'}, axis = 1, inplace = True)
         print(f'Deleted {"{:,}".format(__DB__.startingPitchers.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} starting pitchers')
@@ -249,22 +252,22 @@ class StatcastData:
 
     def batter_game_agg(self) -> pd.DataFrame:
         df = self.__at_bats_df__.copy()
-        df['pa'] = 1
-        agg_df = df.groupby(['game_date', 'game_pk', 'home', 'batter'])[['pa', 'xBA', 'hit', 'bip']].sum()
+        df['PA'] = 1
+        agg_df = df.groupby(['game_pk', 'home', 'batter'])[['PA', 'xBA', 'H', 'BIP']].sum()
         agg_df['G'] = 1
-        agg_df['HG'] = agg_df['hit'] >= 1
+        agg_df['HG'] = agg_df['H'] >= 1
         agg_df['xHG'] = agg_df['xBA'] >= 1
         return agg_df.rename({'xBA': 'xH'}, axis = 1).reset_index()
 
     def batter_season_agg(game_agg_df: pd.DataFrame):
-        agg_df = game_agg_df.groupby('batter')[['G', 'HG', 'xHG', 'pa', 'hit', 'xH', 'bip']].sum()
-        agg_df['H/PA'] = agg_df['hit'] / agg_df['pa']
-        agg_df['xH/PA'] = agg_df['xH'] / agg_df['pa']
-        agg_df['H/G'] = agg_df['hit'] / agg_df['G']
+        agg_df = game_agg_df.groupby('batter')[['G', 'HG', 'xHG', 'PA', 'H', 'xH', 'BIP']].sum()
+        agg_df['H/PA'] = agg_df['H'] / agg_df['PA']
+        agg_df['xH/PA'] = agg_df['xH'] / agg_df['PA']
+        agg_df['H/G'] = agg_df['H'] / agg_df['G']
         agg_df['xH/G'] = agg_df['xH'] / agg_df['G']
         agg_df['H%'] = agg_df['HG'] / agg_df['G']
         agg_df['xH%'] = agg_df['xHG'] / agg_df['G']
-        return agg_df[['G', 'pa', 'H/PA', 'xH/PA', 'H/G', 'xH/G', 'H%', 'xH%']].reset_index()
+        return agg_df[['G', 'PA', 'H/PA', 'xH/PA', 'H/G', 'xH/G', 'H%', 'xH%']].reset_index()
 
     def __enrich_with_stats_api_game_data__(self):
         games_df = pd.concat(
