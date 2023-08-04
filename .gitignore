@@ -2,3 +2,4 @@
 __pycache__/*
 ref/*
 test.ipynb
+.vscode/*
