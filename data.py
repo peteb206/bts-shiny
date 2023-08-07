@@ -2,6 +2,7 @@ import json
 import pandas as pd
 import io
 import requests
+import urllib.parse
 from datetime import date, timedelta, datetime
 import pymongo
 from pymongoarrow.api import find_pandas_all
@@ -27,6 +28,33 @@ if path.isfile('.env'):
             x = line.split('=')
             env[x[0]] = x[1]
 __DB__ = pymongo.MongoClient(f'mongodb+srv://peteb206:{env.get("MONGODB_PASSWORD")}@btscluster.tp9p0.mongodb.net').get_database('bts')
+
+def update_db(year: int):
+    # At Bats
+    new_at_bat_df = StatcastData.add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
+    # Sprint Speeds
+    StatcastData.add_season_sprint_speeds_to_db(year)
+    # Game dates and starting pitchers
+    game_pks = new_at_bat_df['game_pk'].unique().tolist()
+    print('-' * 50)
+    game_dates_df = new_at_bat_df[['game_date', 'game_pk', 'away_team', 'home_team']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
+    starting_pitchers_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).groupby(['game_pk', 'home'])['pitcher'].first() \
+        .reset_index().pivot(index = 'game_pk', columns = 'home')['pitcher'] \
+        .rename({False: 'away_starter', True: 'home_starter'}, axis = 1).reset_index()
+    games_df = game_dates_df.merge(starting_pitchers_df, on = 'game_pk')
+    print(f'Deleted {"{:,}".format(__DB__.games.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} games')
+    __DB__.games.insert_many(games_df.to_dict('records'))
+    print('Added', '{:,}'.format(len(games_df.index)), 'games')
+    # Lineup slots
+    print('-' * 50)
+    lineups_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).drop_duplicates(subset = ['game_pk', 'batter'])
+    lineups_df['lineup'] = lineups_df.groupby(['game_pk', 'home']).cumcount() + 1
+    lineups_df = lineups_df[lineups_df['lineup'] < 10].pivot(index = ['game_pk', 'lineup'], columns = 'home')['batter']
+    lineups_df = lineups_df.rename({False: 'away', True: 'home'}, axis = 1).reset_index()
+    print(f'Deleted {"{:,}".format(__DB__.lineupSlots.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} lineup slots')
+    __DB__.lineupSlots.insert_many(lineups_df.to_dict('records'))
+    print('Added', '{:,}'.format(len(lineups_df.index)), 'lineup slots')
+    print('-' * 80)
 
 def month_start_and_end(year: int, month: int) -> tuple[date, date]:
     return date(year = year, month = month, day = 1), date(year = year, month = month + 1, day = 1) - timedelta(days = 1)
@@ -79,7 +107,7 @@ class MLBData:
         # player_df['team_id'] = player_df['currentTeam'].apply(lambda x: x['id'])
         return player_df[['year', 'id', 'fullName', 'position', 'throws', 'bats', 'active']]
 
-class StatcastData:
+class StatcastData(MLBData):
     __AT_BAT_FINAL_EVENTS__ = [
         'single', 'double', 'triple', 'home_run', 'field_out', 'strikeout', 'strikeout_double_play', 'walk', 'double_play', 'field_error',
         'grounded_into_double_play', 'fielders_choice', 'fielders_choice_out', 'batter_interference', 'catcher_interf', 'force_out', 'hit_by_pitch',
@@ -103,7 +131,7 @@ class StatcastData:
         ## At bat level
         self.games_df: pd.DataFrame = find_pandas_all(__DB__.games, dict(), projection = {'_id': False})
         self.at_bats_df = at_bats_df.merge(self.games_df[['game_pk', 'away_starter', 'home_starter']], on = 'game_pk')
-        # assert len(self.at_bats_df.index) == len(at_bats_df.index)
+        assert len(self.at_bats_df.index) == len(at_bats_df.index)
         self.at_bats_df['starter'] = self.at_bats_df.apply(lambda row: row['pitcher'] in [row['away_starter'], row['home_starter']], axis = 1)
         self.at_bats_df.drop(['away_starter', 'home_starter'], axis = 1, inplace = True)
 
@@ -122,35 +150,7 @@ class StatcastData:
         self.batter_games_df['team'] = self.batter_games_df.apply(lambda row: row['home_team'] if row['home'] else row['away_team'], axis = 1)
         self.batter_games_df['opponent'] = self.batter_games_df.apply(lambda row: row['away_team'] if row['home'] else row['home_team'], axis = 1)
         self.batter_games_df.drop(['away_team', 'home_team', 'away_starter', 'home_starter'], axis = 1, inplace = True)
-        # assert len(self.batter_games_df.index) == len(batter_game_agg_df.index)
-
-    @staticmethod
-    def update_db(year: int):
-        # At Bats
-        new_at_bat_df = StatcastData.add_at_bats_to_db(start_date = date(year, 7 if year == 2020 else 3, 23), end_date = date(year, 10, 6))
-        # Sprint Speeds
-        StatcastData.add_season_sprint_speeds_to_db(year)
-        # Game dates and starting pitchers
-        game_pks = new_at_bat_df['game_pk'].unique().tolist()
-        print('-' * 50)
-        game_dates_df = new_at_bat_df[['game_date', 'game_pk', 'away_team', 'home_team']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
-        starting_pitchers_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).groupby(['game_pk', 'home'])['pitcher'].first() \
-            .reset_index().pivot(index = 'game_pk', columns = 'home')['pitcher'] \
-            .rename({False: 'away_starter', True: 'home_starter'}, axis = 1).reset_index()
-        games_df = game_dates_df.merge(starting_pitchers_df, on = 'game_pk')
-        print(f'Deleted {"{:,}".format(__DB__.games.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} games')
-        __DB__.games.insert_many(games_df.to_dict('records'))
-        print('Added', '{:,}'.format(len(games_df.index)), 'games')
-        # Lineup slots
-        print('-' * 50)
-        lineups_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).drop_duplicates(subset = ['game_pk', 'batter'])
-        lineups_df['lineup'] = lineups_df.groupby(['game_pk', 'home']).cumcount() + 1
-        lineups_df = lineups_df[lineups_df['lineup'] < 10].pivot(index = ['game_pk', 'lineup'], columns = 'home')['batter']
-        lineups_df = lineups_df.rename({False: 'away', True: 'home'}, axis = 1).reset_index()
-        print(f'Deleted {"{:,}".format(__DB__.lineupSlots.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} lineup slots')
-        __DB__.lineupSlots.insert_many(lineups_df.to_dict('records'))
-        print('Added', '{:,}'.format(len(lineups_df.index)), 'lineup slots')
-        print('-' * 80)
+        assert len(self.batter_games_df.index) == len(batter_game_agg_df.index)
 
     @staticmethod
     def add_at_bats_to_db(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)) -> pd.DataFrame:
@@ -193,8 +193,8 @@ class StatcastData:
             # Construct URL and send request
             print('Fetching at bats from ', date_split[0].strftime('%Y-%m-%d'), ' to ', date_split[1].strftime('%Y-%m-%d'), '...', sep = '')
             url_params = {
-                'all': 'true', 'hfAB': requests.utils.quote('|'.join(StatcastData.__AT_BAT_FINAL_EVENTS__).replace('_', '\\.' * 2) + '|'),
-                'hfGT': 'R%7C', 'hfSea': requests.utils.quote('|'.join({str(date_split[0].year), str(date_split[1].year)}) + '|'),
+                'all': 'true', 'hfAB': urllib.parse.quote('|'.join(StatcastData.__AT_BAT_FINAL_EVENTS__).replace('_', '\\.' * 2) + '|'),
+                'hfGT': 'R%7C', 'hfSea': urllib.parse.quote('|'.join({str(date_split[0].year), str(date_split[1].year)}) + '|'),
                 'player_type': 'batter', 'game_date_lt': date_split[1].strftime('%Y-%m-%d'), 'game_date_gt': date_split[0].strftime('%Y-%m-%d'),
                 'min_pitches': 0, 'min_results': 0, 'group_by': 'name', 'sort_col': 'pitches', 'player_event_sort': 'api_p_release_speed',
                 'sort_order': 'desc', 'min_pas': '0', 'type': 'details'
@@ -202,7 +202,7 @@ class StatcastData:
             url = f'https://baseballsavant.mlb.com/statcast_search/csv?{"".join([f"{k}={v}&" for k, v in url_params.items()])}'
 
             # Convert CSV to dataframe and filter to wanted columns
-            df2, baseball_savant_response, attempt = pd.DataFrame(columns = cols), None, 1
+            df2, baseball_savant_response, attempt = pd.DataFrame(columns = cols), requests.Response(), 1
             while (len(df2.index) == 0) & (attempt <= 2):
                 try:
                     baseball_savant_response = get(url)
@@ -229,7 +229,8 @@ class StatcastData:
     def add_season_sprint_speeds_to_db(year: int):
         print('-' * 80)
         print('Adding/Updating sprint speeds for the', year, 'season')
-        new_sprint_speeds_df = StatcastData.get_sprint_speed_csv(year)
+        new_sprint_speeds_df = StatcastData.get_sprint_speed_csv(year) \
+            .merge(MLBData.get_stats_api_players(year).rename({'id': 'batter'}, axis = 1)[['batter', 'bats']], on = 'batter')
         # Delete existing entries
         print('Deleted', __DB__.sprintSpeeds.delete_many({'year': year}).deleted_count, 'sprint speeds')
         # Add new entries
