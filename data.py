@@ -8,6 +8,7 @@ import pymongo
 from pymongoarrow.api import find_pandas_all
 from os import path
 from os import environ as env
+import pickle
 
 # Requests Session
 __SESSION__ = requests.session()
@@ -16,7 +17,7 @@ __SESSION__.headers = {
     'X-Requested-With': 'XMLHttpRequest'
 }
 def get(url: str) -> requests.Response:
-    print('GET', url if len(url) <= 100 else f'{url[:97]}...', end = '')
+    print('GET', url, end = '')
     req = __SESSION__.get(url, timeout = None)
     print(f' ({req.status_code}) {round(req.elapsed.total_seconds(), 2)}s')
     return req
@@ -130,7 +131,9 @@ class StatcastData(MLBData):
         # Combine with other collections
         ## At bat level
         self.games_df: pd.DataFrame = find_pandas_all(__DB__.games, dict(), projection = {'_id': False})
-        self.at_bats_df = at_bats_df.merge(self.games_df[['game_pk', 'away_starter', 'home_starter']], on = 'game_pk')
+        self.at_bats_df = at_bats_df \
+            .merge(self.games_df[['game_pk', 'away_starter', 'home_starter', 'game_date']], on = 'game_pk') \
+            .sort_values(by = ['game_date', 'game_pk', 'home', 'at_bat'], ignore_index = True)
         assert len(self.at_bats_df.index) == len(at_bats_df.index)
         self.at_bats_df['starter'] = self.at_bats_df.apply(lambda row: row['pitcher'] in [row['away_starter'], row['home_starter']], axis = 1)
         self.at_bats_df.drop(['away_starter', 'home_starter'], axis = 1, inplace = True)
@@ -149,8 +152,16 @@ class StatcastData(MLBData):
             .sort_values(by = ['game_date', 'game_pk', 'home', 'lineup'], ignore_index = True)
         self.batter_games_df['team'] = self.batter_games_df.apply(lambda row: row['home_team'] if row['home'] else row['away_team'], axis = 1)
         self.batter_games_df['opponent'] = self.batter_games_df.apply(lambda row: row['away_team'] if row['home'] else row['home_team'], axis = 1)
-        self.batter_games_df.drop(['away_team', 'home_team', 'away_starter', 'home_starter'], axis = 1, inplace = True)
+        self.batter_games_df['opp_starter'] = self.batter_games_df \
+            .apply(lambda row: row['away_starter'] if row['home'] else row['home_starter'], axis = 1)
         assert len(self.batter_games_df.index) == len(batter_game_agg_df.index)
+        with open('models/hp_to_1b.pkl', 'rb') as pkl:
+            hp_to_1b_regression = pickle.load(pkl)
+            self.batter_games_df['rhb'] = self.batter_games_df['bats'] == 'R'
+            null_hp_to_1b = self.batter_games_df['hp_to_1b'].isna() & ~self.batter_games_df['speed'].isna()
+            self.batter_games_df.loc[null_hp_to_1b, 'hp_to_1b'] = hp_to_1b_regression \
+                .predict(self.batter_games_df.loc[null_hp_to_1b, ['rhb', 'speed']]).round(2)
+            self.batter_games_df.drop(['away_team', 'home_team', 'away_starter', 'home_starter', 'rhb', 'speed'], axis = 1, inplace = True)
 
     @staticmethod
     def add_at_bats_to_db(start_date = date(2023, 4, 1), end_date = date(2023, 4, 30)) -> pd.DataFrame:
@@ -250,8 +261,7 @@ class StatcastData(MLBData):
         df = self.at_bats_df.copy()
         df['PA'] = 1
         agg_df = df.groupby(['game_pk', 'home', 'batter'])[['PA', 'xBA', 'H', 'BIP']].sum()
-        agg_df['G'] = 1
-        agg_df['HG'] = agg_df['H'] >= 1
+        agg_df['HG'] = agg_df['H'] > 0
         agg_df['xHG'] = agg_df['xBA'] >= 1
         return agg_df.rename({'xBA': 'xH'}, axis = 1).reset_index()
 
@@ -268,14 +278,76 @@ class StatcastData(MLBData):
 
 class GameDay(StatcastData):
     def __init__(self, game_date: date, statcast_data: StatcastData):
-        print()
+        assert type(game_date) == date
+        significant_games, significant_pas = 50, 200
 
-    def features_df(self):
-        return pd.DataFrame()
+        past_at_bats_df = statcast_data.at_bats_df[statcast_data.at_bats_df['game_date'] < date_to_datetime(game_date)]
+        todays_batters_df = statcast_data.batter_games_df[statcast_data.batter_games_df['game_date'] == date_to_datetime(game_date)] \
+            .merge( # Last _ games
+                statcast_data.batter_games_df[statcast_data.batter_games_df['game_date'] < date_to_datetime(game_date)].groupby('batter') \
+                    .tail(significant_games).groupby('batter').agg({'game_pk': 'count', 'HG': 'mean', 'xHG': 'mean'}).reset_index() \
+                    .rename({'game_pk': 'G', 'HG': 'HG%', 'xHG%': 'mean'}, axis = 1), on = 'batter', suffixes = ('', f'_{significant_games}G')
+            ).merge( # Last _ PAs
+                past_at_bats_df.groupby('batter').tail(significant_pas).groupby('batter') \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}) \
+                    .rename({'game_pk': 'PA', 'xBA': 'xH/PA', 'H': 'H/PA', 'BIP': 'BIP/PA'}, axis = 1) \
+                    .reset_index(), on = 'batter', suffixes = ('', f'_{significant_pas}PA')
+            ).merge( # SP last _ batters faced
+                past_at_bats_df.groupby('pitcher').tail(significant_pas).groupby('pitcher') \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean', 'rhp': 'first'}).reset_index() \
+                    .rename({'pitcher': 'opp_starter', 'game_pk': 'BF', 'xBA': 'xH/BF', 'H': 'H/BF', 'BIP': 'BIP/BF'}, axis = 1),
+                    on = 'opp_starter', suffixes = ('', f'_{significant_pas}BF')
+            ).merge( # SP versus RHB
+                past_at_bats_df[past_at_bats_df['rhb']].groupby('pitcher').tail(significant_pas).groupby('pitcher') \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}).reset_index() \
+                    .rename({'pitcher': 'opp_starter', 'game_pk': 'BF', 'xBA': 'xH/BF', 'H': 'H/BF', 'BIP': 'BIP/BF'}, axis = 1),
+                    on = 'opp_starter', suffixes = ('', f'_{significant_pas}BF_vs_RHB')
+            ).merge( # SP versus LHB
+                past_at_bats_df[~past_at_bats_df['rhb']].groupby('pitcher').tail(significant_pas).groupby('pitcher') \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}).reset_index() \
+                    .rename({'pitcher': 'opp_starter', 'game_pk': 'BF', 'xBA': 'xH/BF', 'H': 'H/BF', 'BIP': 'BIP/BF'}, axis = 1),
+                    on = 'opp_starter', suffixes = ('', f'_{significant_pas}BF_vs_LHB')
+            ).merge( # Versus _HP
+                past_at_bats_df.groupby(['batter', 'rhp']).tail(significant_pas).groupby(['batter', 'rhp']) \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}) \
+                    .rename({'game_pk': 'PA', 'xBA': 'xH/PA', 'H': 'H/PA', 'BIP': 'BIP/PA'}, axis = 1).reset_index(),
+                    on = ['batter', 'rhp'], suffixes = ('', f'_{significant_pas}PA_vs_p_hand')
+            ).merge( # Home/Away
+                past_at_bats_df.groupby(['batter', 'home']).tail(significant_pas).groupby(['batter', 'home']) \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}) \
+                    .rename({'game_pk': 'PA', 'xBA': 'xH/PA', 'H': 'H/PA', 'BIP': 'BIP/PA'}, axis = 1).reset_index(),
+                    on = ['batter', 'home'], suffixes = ('', f'_{significant_pas}PA_at_home_away')
+            ).merge( # Opposing Bullpen
+                past_at_bats_df.merge(statcast_data.batter_games_df[['game_pk', 'home', 'opponent']], on = ['game_pk', 'home']) \
+                    .groupby('opponent').tail(significant_pas * 2).groupby('opponent') \
+                    .agg({'game_pk': 'count', 'xBA': 'mean', 'H': 'mean', 'BIP': 'mean'}) \
+                    .rename({'game_pk': 'BF', 'xBA': 'xH/BF', 'H': 'H/BF', 'BIP': 'BIP/BF'}, axis = 1).reset_index(),
+                    on = 'opponent', suffixes = ('', f'_{significant_pas * 2}BF_bullpen')
+            ).rename({'G': f'G_{significant_games}G', 'xH/PA': f'xH/PA_{significant_pas}PA', 'H/PA': f'H/PA_{significant_pas}PA',
+                      'BIP/PA': f'BIP/PA_{significant_pas}PA', 'BF': f'BF_{significant_pas}BF', 'xH/BF': f'xH/BF_{significant_pas}BF',
+                      'H/BF': f'H/BF_{significant_pas}BF', 'BIP/BF': f'BIP/BF_{significant_pas}BF'}, axis = 1)
 
-    def labels_series(self):
-        return pd.Series()
+        for stat in ['BF', 'xH/BF', 'H/BF', 'BIP/BF']:
+            todays_batters_df[f'{stat}_{significant_pas}BF_vs_b_hand'] = todays_batters_df \
+                .apply(lambda row: row[f'{stat}_{significant_pas}BF_vs_RHB'] if ((row['bats'] == 'R') | ((row['bats'] == 'S') & (not row['rhp']))) \
+                       else row[f'{stat}_{significant_pas}BF_vs_LHB'], axis = 1)
+
+        todays_batters_df = todays_batters_df[
+            (todays_batters_df[f'G_{significant_games}G'] == significant_games) &  (todays_batters_df[f'PA_{significant_pas}PA'] == significant_pas) \
+                & (todays_batters_df[f'BF_{significant_pas}BF'] == significant_pas) & (todays_batters_df['PA'] >= 3)
+        ]
+        self.todays_batters_df = todays_batters_df.dropna(ignore_index = True) \
+            .drop([col for col in todays_batters_df.columns if (col[-2:] == 'HB') | (col[:2] == 'G_') | (col[:3] in ['PA_', 'BF_'])], axis = 1)
+        self.__significant_games__, self.__significant_pas__ = significant_games, significant_pas
+
+    def features(self) -> list[str]:
+        return [col for col in self.todays_batters_df.columns if (str(self.__significant_games__) in col) | (str(self.__significant_pas__) in col) | \
+                (str(self.__significant_pas__ * 2) in col) | (col in ['lineup', 'hp_to_1b'])]
+
+    def labels_series(self) -> pd.Series:
+        return self.todays_batters_df['H'].astype(bool)
 
 if __name__ == '__main__':
     statcast_data = StatcastData()
+    game_day = GameDay(game_date = date.today() - timedelta(days = 1), statcast_data = statcast_data)
     print()
