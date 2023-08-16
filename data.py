@@ -39,9 +39,9 @@ def update_db(year: int):
     game_pks = new_at_bat_df['game_pk'].unique().tolist()
     print('-' * 50)
     game_dates_df = new_at_bat_df[['game_date', 'game_pk', 'away_team', 'home_team']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
-    starting_pitchers_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).groupby(['game_pk', 'home'])['pitcher'].first() \
+    starting_pitchers_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).groupby(['game_pk', 'home']).pitcher.first() \
         .reset_index().pivot(index = 'game_pk', columns = 'home')['pitcher'] \
-        .rename({False: 'away_starter', True: 'home_starter'}, axis = 1).reset_index()
+        .rename({False: 'home_starter', True: 'away_starter'}, axis = 1).reset_index()
     games_df = game_dates_df.merge(starting_pitchers_df, on = 'game_pk')
     print(f'Deleted {"{:,}".format(__DB__.games.delete_many({"game_pk": {"$in": game_pks}}).deleted_count)} games')
     __DB__.games.insert_many(games_df.to_dict('records'))
