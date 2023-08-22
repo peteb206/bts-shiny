@@ -4,4 +4,4 @@ pymongo==3.12.0
 pymongoarrow==1.0.2
 requests==2.31.0
 scikit-learn==1.2.2
-shiny==0.2.9
+shiny==0.5.0

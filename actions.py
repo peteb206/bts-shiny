@@ -15,7 +15,7 @@ def daily():
 
 def full_reset():
     # Refresh all years' data
-    for year in range(2015, today.year):
+    for year in range(2015, today.year + 1):
         update_db(year)
         print()
         time.sleep(60)
