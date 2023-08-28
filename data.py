@@ -102,7 +102,15 @@ def month_start_and_end(year: int, month: int) -> tuple[date, date]:
 def date_to_datetime(date: date) -> datetime:
     return datetime.combine(date, datetime.min.time())
 
-def enhance_at_bats(at_bats_df: pd.DataFrame, games_df: pd.DataFrame, speed_df: pd.DataFrame):
+def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
+    games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gte': from_date}}, projection = {'_id': False})
+    at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
+    speed_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, {'year': {'$gte': from_date.year}}, projection = {'_id': False})
+
+    games_df.set_index('game_pk', inplace = True)
+    at_bats_df.set_index(['game_pk', 'home', 'at_bat', 'batter', 'pitcher'], inplace = True)
+    at_bats_df.sort_index(inplace = True)
+    speed_df.set_index(['year', 'batter'], inplace = True)
     # Starting pitcher
     at_bats_df = at_bats_df.merge(games_df, left_index = True, right_index = True)
     at_bats_df['team'] = np.where(at_bats_df.index.get_level_values('home'), at_bats_df.home_team, at_bats_df.away_team)
@@ -134,7 +142,7 @@ def enhance_at_bats(at_bats_df: pd.DataFrame, games_df: pd.DataFrame, speed_df: 
     at_bats_df['statcast_tracked'] = at_bats_df.index \
         .get_level_values('game_pk') \
             .map(at_bats_df.groupby('game_pk')['xBA'].sum() > 0)
-    print(at_bats_df.statcast_tracked.value_counts(normalize = True).mul(100).round(1)[True], '% of at bats were statcast tracked...', sep = '')
+    # print(at_bats_df.statcast_tracked.value_counts(normalize = True).mul(100).round(1)[True], '% of at bats were statcast tracked...', sep = '')
     return at_bats_df.drop(['year', 'speed', 'away_team', 'home_team', 'away_starter', 'home_starter', 'xBA_med'], axis = 1)
 
 

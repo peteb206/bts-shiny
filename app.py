@@ -1,25 +1,15 @@
 from shiny import App, render, ui
-from data import __DB__, enhance_at_bats
-from model import LogisticRegression1
-from pymongoarrow.api import find_pandas_all
-import pandas as pd
+from data import get_enhanced_at_bats
+from model import BTSBatterClassifier
 from datetime import datetime
 
 # Filter data to begin of 2 seasons ago
 now = datetime.now()
 print('Fetching data from DB...', end = '')
-games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gt': datetime(now.year - 2, 1, 1)}}, projection = {'_id': False})
-at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
-speed_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, {'year': {'$gte': now.year}}, projection = {'_id': False})
+enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(now.year - 2, 1, 1))
 print(' complete after', round((datetime.now() - now).seconds, 1), 'seconds')
 
-games_df.set_index('game_pk', inplace = True)
-at_bats_df.set_index(['game_pk', 'home', 'at_bat', 'batter', 'pitcher'], inplace = True)
-at_bats_df.sort_index(inplace = True)
-speed_df.set_index(['year', 'batter'], inplace = True)
-
-enhanced_at_bats = enhance_at_bats(at_bats_df = at_bats_df, games_df = games_df, speed_df = speed_df)
-log_reg = LogisticRegression1(enhanced_at_bats)
+log_reg = BTSBatterClassifier(None, enhanced_at_bats, 'log_reg')
 
 app_ui = ui.page_fluid(
     ui.tags.style(

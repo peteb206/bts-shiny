@@ -7,18 +7,72 @@ import pickle
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegressionCV
 import matplotlib.pyplot as plt
-# import IPython.display as display
 
-class LogisticRegression1:
+class BTSBatterClassifier:
+    '''
+    # Example
+
+    ## Read data from MongoDB
+    games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gt': datetime(now.year - 2, 1, 1)}}, projection = {'_id': False})
+    at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
+    speed_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, {'year': {'$gte': datetime.now().year}}, projection = {'_id': False})
+
+    games_df.set_index('game_pk', inplace = True)
+    at_bats_df.set_index(['game_pk', 'home', 'at_bat', 'batter', 'pitcher'], inplace = True)
+    at_bats_df.sort_index(inplace = True)
+    speed_df.set_index(['year', 'batter'], inplace = True)
+
+    ## Build classifier
+    enhanced_at_bats = enhance_at_bats(at_bats_df = at_bats_df, games_df = games_df, speed_df = speed_df)
+    log_reg = BTSBatterClassifier(LogisticRegressionCV(cv = 10, random_state = 57), at_bats_df, 'log_reg')
+    ### Fit classifier
+    log_reg.fit_model(scale_features = True, perform_pca = True)
+    ### Simulate results on test data
+    log_reg.simulate_results()
+    ### Get predictions for today
+    log_reg.todays_predictions()
+    '''
     SIGNIFICANT_GAMES, MINIMUM_GAMES = 50, 25
     SIGNIFICANT_PAS, MINIMUM_PAS = 200, 100
-    PKL_PATH = '/Users/peteberryman/Desktop/bts-shiny/models/log_reg.pkl'
+    PKL_DIR = '/Users/peteberryman/Desktop/bts-shiny/models'
 
-    def __init__(self, at_bats_df: pd.DataFrame):
+    def __init__(self, clf, at_bats_df = pd.DataFrame(), pkl_name = ''):
+        assert pkl_name != ''
+        self.clf = clf
         self.at_bats_df = at_bats_df
-        self.added_todays_batters_to_at_bats = False
+        self.__added_todays_batters_to_at_bats__ = False
+        # Train/test split
+        self.X_train, self.X_test = pd.DataFrame(), pd.DataFrame()
+        self.y_train, self.y_test = pd.Series(dtype = int), pd.Series(dtype = int)
+        self.model_input_df = pd.DataFrame()
+        self.pkl_name = pkl_name
+
+    def build_model_input_df(self):
+        # TODO: Batter vs Pitcher and include
+        game_days_df = self.at_bats_df \
+            .groupby(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
+                .agg({'opp_sp': ['count', 'first'], 'H': max, 'hp_to_1b': 'first'}) #, 'bats': 'first', 'lineup': 'first'
+        game_days_df.columns = ['PA' if col[1] == 'count' else col[0] for col in game_days_df.columns]
+        game_days_df.set_index('opp_sp', append = True, inplace = True)
+
+        self.model_input_df = game_days_df \
+            .merge(self.batter_per_game_agg(), left_index = True, right_index = True) \
+                .merge(self.batter_per_pa_agg(), left_index = True, right_index = True) \
+                    .merge(self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'}),
+                           left_index = True, right_index = True) \
+                        .merge(self.bullpen_per_bf_agg(), left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
+                            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
+                                .sort_index() \
+                                    .query(f'''
+                                           PA >= 3 and G_last_{self.SIGNIFICANT_GAMES}G >= {self.MINIMUM_GAMES} and
+                                           PA_last_{self.SIGNIFICANT_PAS}PA >= {self.MINIMUM_PAS} and
+                                           BF_last_{self.SIGNIFICANT_PAS}BF >= {self.MINIMUM_PAS} and
+                                           BF_last_{self.SIGNIFICANT_PAS}BF_bullpen >= {self.MINIMUM_PAS}
+                                    '''.replace('\n', '')) \
+                                        .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G', f'PA_last_{self.SIGNIFICANT_PAS}PA',
+                                               f'BF_last_{self.SIGNIFICANT_PAS}BF', f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
+                                            .dropna()
 
     def batter_per_game_agg(self, significant_games = SIGNIFICANT_GAMES) -> pd.DataFrame:
         batter_games_df = self.at_bats_df \
@@ -91,7 +145,7 @@ class LogisticRegression1:
         bfs_df = self.at_bats_df[self.at_bats_df.index.get_level_values('pitcher') != 0].fillna({'xBA': 0})
         bfs_df['BF'] = 1
         bfs_df['K'] = bfs_df.events.isin(['strikeout', 'strikeout_double_play'])
-        bfs_df['BB'] = bfs_df.events == 'walk'
+        bfs_df['BB'] = bfs_df.events.isin(['walk', 'hit_by_pitch'])
         # display(bfs_df[bfs_df.index.get_level_values('pitcher') == 457435])
         bfs_df = bfs_df.loc[:, ['BF', 'xBA', 'H', 'K', 'BB', 'statcast_tracked']].astype(float) \
             .groupby('pitcher').cumsum() \
@@ -121,7 +175,7 @@ class LogisticRegression1:
         bfs_df = self.at_bats_df.loc[self.at_bats_df.opp_sp != self.at_bats_df.index.get_level_values('pitcher')].fillna({'xBA': 0})
         bfs_df['BF'] = 1
         bfs_df['K'] = bfs_df.events.isin(['strikeout', 'strikeout_double_play'])
-        bfs_df['BB'] = bfs_df.events == 'walk'
+        bfs_df['BB'] = bfs_df.events.isin(['walk', 'hit_by_pitch'])
         bfs_df = bfs_df.loc[:, ['BF', 'xBA', 'H', 'K', 'BB', 'statcast_tracked']].astype(float) \
             .groupby('opponent').cumsum(numeric_only = True) \
                 .groupby('opponent').shift(1).fillna(0)
@@ -147,84 +201,87 @@ class LogisticRegression1:
         bfs_df.drop([col for col in bfs_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
         return bfs_df.fillna(0).groupby(['game_date', 'game_pk', 'opponent']).first()
 
-    def aggregated_df(self, filtered = True):
-        game_days_df = self.at_bats_df \
-            .groupby(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
-                .agg({'opp_sp': ['count', 'first'], 'H': max, 'hp_to_1b': 'first'}) #, 'bats': 'first', 'lineup': 'first'
-        game_days_df.columns = ['PA' if col[1] == 'count' else col[0] for col in game_days_df.columns]
-        game_days_df.set_index('opp_sp', append = True, inplace = True)
+    def fit_model(self, scale_features = True, perform_pca = False):
+        self.build_model_input_df()
 
-        game_days_df = game_days_df \
-            .merge(self.batter_per_game_agg(), left_index = True, right_index = True) \
-                .merge(self.batter_per_pa_agg(), left_index = True, right_index = True) \
-                    .merge(self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'}),
-                           left_index = True, right_index = True) \
-                        .merge(self.bullpen_per_bf_agg(), left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
-                            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
-                                .sort_index()
-        if filtered:
-            game_days_df = game_days_df.loc[
-                (game_days_df.PA >= 3) \
-                    & (game_days_df[f'G_last_{self.SIGNIFICANT_GAMES}G'] >= self.MINIMUM_GAMES) \
-                        & (game_days_df[f'PA_last_{self.SIGNIFICANT_PAS}PA'] >= self.MINIMUM_PAS) \
-                            & (game_days_df[f'BF_last_{self.SIGNIFICANT_PAS}BF'] >= self.MINIMUM_PAS) \
-                                & (game_days_df[f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'] >= self.MINIMUM_PAS)] \
-                                    .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G', f'PA_last_{self.SIGNIFICANT_PAS}PA',
-                                           f'BF_last_{self.SIGNIFICANT_PAS}BF', f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
-                                        .dropna()
-        return game_days_df
-
-    def build_model(self):
-        filtered_game_days_df = self.aggregated_df()
         # Correlation matrix
-        # correlation_matrix = filtered_game_days_df.loc[:, filtered_game_days_df.dtypes == float].corr()
-        # for row_num in range(len(correlation_matrix.index)):
-        #     for col_num in range(len(correlation_matrix.columns)):
-        #         if row_num <= col_num:
-        #             correlation_matrix.iloc[row_num, col_num] = None
-        # correlation_matrix.style.background_gradient(cmap = 'bwr', axis = None, vmin = -1, vmax = 1).highlight_null(color = '#f1f1f1').format(precision = 2) \
-        #     .set_table_styles([
-        #         {'selector': 'th.col_heading', 'props': [('text-align', 'left'), ('writing-mode', 'vertical-rl'), ('transform', 'rotateZ(192deg)')]},
-        #         {'selector': 'td, th', 'props': [('border', '1px solid black !important')]}
-        #     ])
-        # display.display_html(correlation_matrix)
+        '''
+        correlation_matrix = self.model_input_df.loc[:, self.model_input_df.dtypes == float].corr()
+        for row_num in range(len(correlation_matrix.index)):
+            for col_num in range(len(correlation_matrix.columns)):
+                if row_num <= col_num:
+                    correlation_matrix.iloc[row_num, col_num] = None
+        correlation_matrix.style.background_gradient(cmap = 'bwr', axis = None, vmin = -1, vmax = 1).highlight_null(color = '#f1f1f1').format(precision = 2) \
+            .set_table_styles([
+                {'selector': 'th.col_heading', 'props': [('text-align', 'left'), ('writing-mode', 'vertical-rl'), ('transform', 'rotateZ(192deg)')]},
+                {'selector': 'td, th', 'props': [('border', '1px solid black !important')]}
+            ])
+        try:
+            display(correlation_matrix)
+        except:
+            import IPython.display as display
+            display.display_html(correlation_matrix)
+        '''
 
         # Scale data https://stackoverflow.com/a/59164898
-        features_df = filtered_game_days_df.select_dtypes(include = 'float64')
-        scaler = StandardScaler().fit(features_df)
-        scaled_features_df = pd.DataFrame(scaler.transform(features_df), index = features_df.index, columns = features_df.columns)
+        features_df = self.model_input_df.select_dtypes(include = 'float64')
+        scaler = None
+        if scale_features:
+            scaler = StandardScaler().fit(features_df)
+            features_df = pd.DataFrame(scaler.transform(features_df), index = features_df.index, columns = features_df.columns)
 
         # Train/test split
         train_game_dates, test_game_dates = train_test_split(features_df.index.get_level_values('game_date').unique(),
                                                              test_size = 0.3, random_state = 57)
-        X_train = scaled_features_df.loc[scaled_features_df.index.get_level_values('game_date').isin(train_game_dates)]
-        X_test = scaled_features_df.loc[scaled_features_df.index.get_level_values('game_date').isin(test_game_dates)]
-        y_train = filtered_game_days_df.loc[filtered_game_days_df.index.get_level_values('game_date').isin(train_game_dates), 'H']
-        y_test = filtered_game_days_df.loc[filtered_game_days_df.index.get_level_values('game_date').isin(test_game_dates), 'H']
+        self.X_train = features_df.loc[features_df.index.get_level_values('game_date').isin(train_game_dates)]
+        self.X_test = features_df.loc[features_df.index.get_level_values('game_date').isin(test_game_dates)]
+        self.y_train = self.model_input_df.loc[self.model_input_df.index.get_level_values('game_date').isin(train_game_dates), 'H']
+        self.y_test = self.model_input_df.loc[self.model_input_df.index.get_level_values('game_date').isin(test_game_dates), 'H']
 
         # PCA https://datascience.stackexchange.com/a/55080
-        pca = PCA(n_components = 0.99, svd_solver = 'full', random_state = 57).fit(X_train)
-        print('Initial', len(X_train.columns), 'features:', ', '.join(X_train.columns))
-        print('PCA: # of features reduced from', len(X_train.columns), 'to', pca.n_components_)
-        X_train = pd.DataFrame(pca.transform(X_train), index = X_train.index, columns = [f'PC{f + 1}' for f in range(pca.n_components_)])
-        X_test = pd.DataFrame(pca.transform(X_test), index = X_test.index, columns = [f'PC{f + 1}' for f in range(pca.n_components_)])
+        pca = None
+        if perform_pca:
+            assert scale_features, 'PCA cannot be performed if features are not normalized'
+            pca = PCA(n_components = 0.99, svd_solver = 'full', random_state = 57).fit(self.X_train)
+            print('Initial', len(self.X_train.columns), 'features:', ', '.join(self.X_train.columns))
+            print('PCA: # of features reduced from', len(self.X_train.columns), 'to', pca.n_components_)
+            self.X_train = pd.DataFrame(pca.transform(self.X_train), index = self.X_train.index,
+                                        columns = [f'PC{f + 1}' for f in range(pca.n_components_)])
+            self.X_test = pd.DataFrame(pca.transform(self.X_test), index = self.X_test.index,
+                                       columns = [f'PC{f + 1}' for f in range(pca.n_components_)])
 
         # Logistic Regression
-        clf = LogisticRegressionCV(cv = 10, random_state = 57).fit(X_train, y_train)
-        print('Score on training data:', round(clf.score(X_train, y_train), 3))
-        print('Score on testing data:', round(clf.score(X_test, y_test), 3))
+        self.clf.fit(self.X_train, self.y_train)
+        print('Score on training data:', round(self.clf.score(self.X_train, self.y_train), 3))
+        print('Score on testing data:', round(self.clf.score(self.X_test, self.y_test), 3))
 
-        # Predict
-        filtered_game_days_df.loc[filtered_game_days_df.index.get_level_values('game_date').isin(test_game_dates), 'H_prob'] = \
-            clf.predict_proba(X_test)[:, -1]
-        filtered_game_days_df[~filtered_game_days_df.H_prob.isna()]
+        # Dump pickle file
+        pickle.dump((scaler, pca, self.clf), open(f'{self.PKL_DIR}/{self.pkl_name}.pkl', 'wb'))
+        # Confirm success
+        # print(pickle.load(open(f'{self.PKL_DIR}/{self.pkl_name}.pkl', 'rb')))
 
-        # Simulate Results
-        threshold = 0.73
-        top_two_picks_by_day_df = filtered_game_days_df[filtered_game_days_df.H_prob >= threshold] \
-            .sort_values(['game_date', 'H_prob'], ascending = [True, False]) \
-                .groupby('game_date') \
-                    .head(2)
+    def __add_todays_batters_to_at_bats__(self, todays_batters_df: pd.DataFrame):
+        # Add dummy at bats for today's hitters
+        if not self.__added_todays_batters_to_at_bats__:
+            for at_bat in range(1, 4):
+                todays_batters_at_bats_df = todays_batters_df.drop(['name', 'opp_sp_name'], axis = 1)
+                todays_batters_at_bats_df['at_bat'] = at_bat
+                todays_batters_at_bats_df['pitcher'] = todays_batters_at_bats_df.opp_sp if at_bat < 3 else 0
+                todays_batters_at_bats_df.set_index(['at_bat', 'pitcher'], append = True, inplace = True)
+                todays_batters_at_bats_df = todays_batters_at_bats_df.reorder_levels(self.at_bats_df.index.names)
+                todays_batters_at_bats_df[['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']] = \
+                    self.at_bats_df.tail(len(todays_batters_at_bats_df.index)) \
+                        .loc[:, ['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']]
+                todays_batters_at_bats_df = todays_batters_at_bats_df.astype(self.at_bats_df.dtypes)
+                self.at_bats_df = pd.concat([self.at_bats_df, todays_batters_at_bats_df])
+            self.__added_todays_batters_to_at_bats__ = True
+
+    def simulate_results(self):
+        test_df = self.X_test.copy()
+        test_df['H_prob'] = self.clf.predict_proba(test_df)[:, -1]
+        test_df['H'] = self.y_test.copy()
+
+        top_two_picks_by_day_df = test_df.sort_values(['game_date', 'H_prob'], ascending = [True, False]).groupby('game_date').head(2)
 
         streak, streaks = 0, list()
         for _, row in top_two_picks_by_day_df.groupby('game_date').H.agg(['count', 'min']).iterrows():
@@ -240,16 +297,11 @@ class LogisticRegression1:
 
         plt.hist(streaks, bins = list(range(1, 58)))
         plt.title('\n'.join([
+            self.pkl_name,
             f'Best Streak: {max(streaks) if len(streaks) > 0 else 0}',
-            f'Decision Threshold: {100 * threshold}%',
             f'{100 * round(top_two_picks_by_day_df.H.astype(bool).mean(), 2)}% Pick Accuracy'
         ]))
         plt.show()
-
-        # Dump pickle file
-        pickle.dump((scaler, pca, clf), open(self.PKL_PATH, 'wb'))
-        # Confirm success
-        print(pickle.load(open(self.PKL_PATH, 'rb')))
 
     def todays_predictions(self):
         todays_batters_df = data.get_todays_batters()
@@ -257,27 +309,19 @@ class LogisticRegression1:
         todays_batters_df = todays_batters_df.merge(self.at_bats_df.groupby('batter').hp_to_1b.last(), how = 'left', left_index = True,
                                                     right_index = True) # most recent time
 
-        # Add dummy at bats for today's hitters
-        if not self.added_todays_batters_to_at_bats:
-            for at_bat in range(1, 4):
-                todays_batters_at_bats_df = todays_batters_df.drop(['name', 'opp_sp_name'], axis = 1)
-                todays_batters_at_bats_df['at_bat'] = at_bat
-                todays_batters_at_bats_df['pitcher'] = todays_batters_at_bats_df.opp_sp if at_bat < 3 else 0
-                todays_batters_at_bats_df.set_index(['at_bat', 'pitcher'], append = True, inplace = True)
-                todays_batters_at_bats_df = todays_batters_at_bats_df.reorder_levels(self.at_bats_df.index.names)
-                todays_batters_at_bats_df[['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']] = \
-                    self.at_bats_df.tail(len(todays_batters_at_bats_df.index)).loc[:, ['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']]
-                todays_batters_at_bats_df = todays_batters_at_bats_df.astype(self.at_bats_df.dtypes)
-                self.at_bats_df = pd.concat([self.at_bats_df, todays_batters_at_bats_df])
-            self.added_todays_batters_to_at_bats = True
+        self.__add_todays_batters_to_at_bats__(todays_batters_df)
+        self.build_model_input_df()
 
-        game_days_df = self.aggregated_df()
-        todays_options_df = todays_batters_df.loc[:, ['name', 'lineup', 'opp_sp_name',]].merge(game_days_df, left_index = True, right_index = True)
+        todays_options_df = todays_batters_df.loc[:, ['name', 'lineup', 'opp_sp_name',]] \
+            .merge(self.model_input_df, left_index = True, right_index = True)
 
-        scaler, pca, clf = pickle.load(open(self.PKL_PATH, 'rb'))
-        todays_options_scaled_df = pd.DataFrame(scaler.transform(todays_options_df.loc[:, scaler.feature_names_in_]), index = todays_options_df.index,
-                                                columns = scaler.feature_names_in_)
-        todays_options_pcs_df = pd.DataFrame(pca.transform(todays_options_scaled_df), index = todays_options_scaled_df.index,
+        scaler, pca, clf = pickle.load(open(f'{self.PKL_DIR}/{self.pkl_name}.pkl', 'rb'))
+        if scaler != None:
+            todays_options_df = pd.DataFrame(scaler.transform(todays_options_df.loc[:, scaler.feature_names_in_]), index = todays_options_df.index,
+                                             columns = scaler.feature_names_in_)
+        if pca != None:
+            todays_options_df = pd.DataFrame(pca.transform(todays_options_df), index = todays_options_df.index,
                                              columns = [f'PC{f + 1}' for f in range(pca.n_components_)])
-        todays_options_df.loc[:, 'H%'] = clf.predict_proba(todays_options_pcs_df)[:, -1]
-        return todays_options_df.sort_values(by = 'H%', ascending = False)
+        todays_options_df.reset_index(level = 'opp_sp', drop = True, inplace = True)
+        todays_options_df.loc[:, 'H%'] = clf.predict_proba(todays_options_df)[:, -1]
+        return todays_batters_df.merge(todays_options_df[['H%']], left_index = True, right_index = True).sort_values(by = 'H%', ascending = False)
