@@ -49,7 +49,6 @@ class BTSBatterClassifier:
         self.pkl_name = pkl_name
 
     def build_model_input_df(self):
-        # TODO: Batter vs Pitcher and include
         game_days_df = self.at_bats_df \
             .groupby(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
                 .agg({'opp_sp': ['count', 'first'], 'H': max, 'hp_to_1b': 'first'}) #, 'bats': 'first', 'lineup': 'first'
@@ -58,25 +57,34 @@ class BTSBatterClassifier:
 
         self.model_input_df = game_days_df \
             .merge(self.batter_per_game_agg(), left_index = True, right_index = True) \
-                .merge(self.batter_per_pa_agg(), left_index = True, right_index = True) \
-                    .merge(self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'}),
-                           left_index = True, right_index = True) \
-                        .merge(self.bullpen_per_bf_agg(), left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
-                            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
-                                .sort_index() \
-                                    .query(f'''
-                                           PA >= 3 and G_last_{self.SIGNIFICANT_GAMES}G >= {self.MINIMUM_GAMES} and
-                                           PA_last_{self.SIGNIFICANT_PAS}PA >= {self.MINIMUM_PAS} and
-                                           BF_last_{self.SIGNIFICANT_PAS}BF >= {self.MINIMUM_PAS} and
-                                           BF_last_{self.SIGNIFICANT_PAS}BF_bullpen >= {self.MINIMUM_PAS}
-                                    '''.replace('\n', '')) \
-                                        .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G', f'PA_last_{self.SIGNIFICANT_PAS}PA',
-                                               f'BF_last_{self.SIGNIFICANT_PAS}BF', f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
-                                            .dropna()
+                .merge(self.batter_per_game_agg(split_cols = ['home']), left_index = True, right_index = True, suffixes = ('', '_home_away')) \
+                    .merge(self.batter_per_pa_agg(), left_index = True, right_index = True) \
+                        .merge(self.batter_per_pa_agg(split_cols = ['rhp']), left_index = True, right_index = True, suffixes = ('', '_vs_hp')) \
+                            .merge(self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'}), left_index = True, right_index = True) \
+                                .merge(self.pitcher_per_bf_agg(split_cols = ['rhb']).rename_axis(index = {'pitcher': 'opp_sp'}),
+                                       left_index = True, right_index = True, suffixes = ('', '_vs_hb')) \
+                                    .merge(self.bullpen_per_bf_agg(), left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
+                                        .merge(self.batter_per_pa_agg(split_cols = ['pitcher']), left_index = True, right_index = True,
+                                               suffixes = ('', '_vs_opp_sp')) \
+                                            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
+                                                .sort_index() \
+                                                    .query(f'''
+                                                        PA >= 3 and G_last_{self.SIGNIFICANT_GAMES}G >= {self.MINIMUM_GAMES} and
+                                                        PA_last_{self.SIGNIFICANT_PAS}PA >= {self.MINIMUM_PAS} and
+                                                        BF_last_{self.SIGNIFICANT_PAS}BF >= {self.MINIMUM_PAS} and
+                                                        BF_last_{self.SIGNIFICANT_PAS}BF_bullpen >= {self.MINIMUM_PAS}
+                                                    '''.replace('\n', '')) \
+                                                        .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G',
+                                                               f'G_last_{self.SIGNIFICANT_GAMES}G_home_away', f'PA_last_{self.SIGNIFICANT_PAS}PA',
+                                                               f'PA_last_{self.SIGNIFICANT_PAS}PA_vs_hp', f'BF_last_{self.SIGNIFICANT_PAS}BF',
+                                                               f'BF_last_{self.SIGNIFICANT_PAS}BF_vs_hb',
+                                                               f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
+                                                            .dropna()
 
-    def batter_per_game_agg(self, significant_games = SIGNIFICANT_GAMES) -> pd.DataFrame:
+    def batter_per_game_agg(self, split_cols: list[str] = [], significant_games = SIGNIFICANT_GAMES) -> pd.DataFrame:
+        group_by = ['batter'] + split_cols
         batter_games_df = self.at_bats_df \
-            .groupby(['game_date', 'game_pk', 'batter']) \
+            .groupby(['game_date', 'game_pk', 'home', 'batter']) \
                 .agg({'xBA': sum, 'H': sum, 'BIP': sum, 'statcast_tracked': ['count', 'first']})
         batter_games_df.columns = ['PA' if (col[0] == 'statcast_tracked') & (col[1] == 'count') else col[0] for col in batter_games_df.columns]
         batter_games_df = batter_games_df.loc[batter_games_df.PA >= 3] # don't include partial games
@@ -85,87 +93,93 @@ class BTSBatterClassifier:
         batter_games_df['HG'] = batter_games_df.H >= 1
         batter_games_df['xHG'] = batter_games_df.xBA >= 1
         batter_games_df = batter_games_df.astype({'BIP': int, 'statcast_tracked': int})
-        batter_games_df = batter_games_df.astype(float).groupby('batter').cumsum().groupby('batter').shift(1).fillna(0)
+        batter_games_df = batter_games_df.astype(float).groupby(group_by).cumsum().groupby(group_by).shift(1).fillna(0)
         batter_games_df.rename({col: 'cumulG_statcast' if col == 'statcast_tracked' else f'cumul{col}' for col in batter_games_df.columns},
                                axis = 1, inplace = True)
         batter_games_df[f'G_last_{significant_games}G'] = \
-            (batter_games_df.cumulG - batter_games_df.groupby('batter').cumulG.shift(significant_games)) \
+            (batter_games_df.cumulG - batter_games_df.groupby(group_by).cumulG.shift(significant_games)) \
                 .combine_first(batter_games_df.cumulG).astype(int)
         batter_games_df[f'statcast_G_last_{significant_games}G'] = \
-            (batter_games_df.cumulG_statcast - batter_games_df.groupby('batter').cumulG_statcast.shift(significant_games)) \
+            (batter_games_df.cumulG_statcast - batter_games_df.groupby(group_by).cumulG_statcast.shift(significant_games)) \
                 .combine_first(batter_games_df.cumulG_statcast)
         batter_games_df[f'HG%_last_{significant_games}G'] = \
-            (batter_games_df.cumulHG - batter_games_df.groupby('batter').cumulHG.shift(significant_games)).combine_first(batter_games_df.cumulHG) \
+            (batter_games_df.cumulHG - batter_games_df.groupby(group_by).cumulHG.shift(significant_games)).combine_first(batter_games_df.cumulHG) \
                 .div(batter_games_df[f'G_last_{significant_games}G'])
         batter_games_df[f'xHG%_last_{significant_games}G'] = \
-            (batter_games_df.cumulxHG - batter_games_df.groupby('batter').cumulxHG.shift(significant_games)).combine_first(batter_games_df.cumulxHG) \
+            (batter_games_df.cumulxHG - batter_games_df.groupby(group_by).cumulxHG.shift(significant_games)).combine_first(batter_games_df.cumulxHG) \
                 .div(batter_games_df[f'statcast_G_last_{significant_games}G'])
         batter_games_df[f'PA/G_last_{significant_games}G'] = \
-            (batter_games_df.cumulPA - batter_games_df.groupby('batter').cumulPA.shift(significant_games)).combine_first(batter_games_df.cumulPA) \
+            (batter_games_df.cumulPA - batter_games_df.groupby(group_by).cumulPA.shift(significant_games)).combine_first(batter_games_df.cumulPA) \
                 .div(batter_games_df[f'G_last_{significant_games}G'])
         batter_games_df[f'BIP/G_last_{significant_games}G'] = \
-            (batter_games_df.cumulBIP - batter_games_df.groupby('batter').cumulBIP.shift(significant_games)).combine_first(batter_games_df.cumulBIP) \
+            (batter_games_df.cumulBIP - batter_games_df.groupby(group_by).cumulBIP.shift(significant_games)).combine_first(batter_games_df.cumulBIP) \
                 .div(batter_games_df[f'G_last_{significant_games}G'])
         batter_games_df[f'H/G_last_{significant_games}G'] = \
-            (batter_games_df.cumulH - batter_games_df.groupby('batter').cumulH.shift(significant_games)).combine_first(batter_games_df.cumulH) \
+            (batter_games_df.cumulH - batter_games_df.groupby(group_by).cumulH.shift(significant_games)).combine_first(batter_games_df.cumulH) \
                 .div(batter_games_df[f'G_last_{significant_games}G'])
         batter_games_df[f'xH/G_last_{significant_games}G'] = \
-            (batter_games_df.cumulxBA - batter_games_df.groupby('batter').cumulxBA.shift(significant_games)).combine_first(batter_games_df.cumulxBA) \
+            (batter_games_df.cumulxBA - batter_games_df.groupby(group_by).cumulxBA.shift(significant_games)).combine_first(batter_games_df.cumulxBA) \
                 .div(batter_games_df[f'statcast_G_last_{significant_games}G'])
         # display(batter_games_df[batter_games_df.index.isin([668804], level = 3)])
         batter_games_df.drop([col for col in batter_games_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))],
                              axis = 1, inplace = True)
         return batter_games_df.fillna(0)
 
-    def batter_per_pa_agg(self, significant_pas = SIGNIFICANT_PAS) -> pd.DataFrame:
+    def batter_per_pa_agg(self, split_cols: list[str] = [], significant_pas = SIGNIFICANT_PAS) -> pd.DataFrame:
+        group_by = ['batter'] + split_cols
         pas_df = self.at_bats_df.fillna({'xBA': 0})
+        if len(split_cols) > 0:
+            pas_df.set_index([col for col in split_cols if col in pas_df.columns], append = True, inplace = True)
         # display(pas_df[pas_df.index.get_level_values('batter') == 660670])
         pas_df['PA'] = 1
         pas_df = pas_df.loc[:, ['PA', 'xBA', 'H', 'BIP', 'statcast_tracked']].astype(float) \
-            .groupby('batter').cumsum().groupby('batter').shift(1).fillna(0)
+            .groupby(group_by).cumsum().groupby(group_by).shift(1).fillna(0)
         pas_df.rename({col: 'cumulPA_statcast' if col == 'statcast_tracked' else f'cumul{col}' for col in pas_df.columns}, axis = 1, inplace = True)
         pas_df[f'PA_last_{significant_pas}PA'] = \
-            (pas_df.cumulPA - pas_df.groupby('batter').cumulPA.shift(significant_pas)).combine_first(pas_df.cumulPA).astype(int)
+            (pas_df.cumulPA - pas_df.groupby(group_by).cumulPA.shift(significant_pas)).combine_first(pas_df.cumulPA).astype(int)
         pas_df[f'statcast_PA_last_{significant_pas}PA'] = \
-            (pas_df.cumulPA_statcast - pas_df.groupby('batter').cumulPA_statcast.shift(significant_pas)).combine_first(pas_df.cumulPA_statcast)
+            (pas_df.cumulPA_statcast - pas_df.groupby(group_by).cumulPA_statcast.shift(significant_pas)).combine_first(pas_df.cumulPA_statcast)
         pas_df[f'BIP/PA_last_{significant_pas}PA'] = \
-            (pas_df.cumulBIP - pas_df.groupby('batter').cumulBIP.shift(significant_pas)).combine_first(pas_df.cumulBIP) \
+            (pas_df.cumulBIP - pas_df.groupby(group_by).cumulBIP.shift(significant_pas)).combine_first(pas_df.cumulBIP) \
                 .div(pas_df[f'PA_last_{significant_pas}PA'])
         pas_df[f'H/PA_last_{significant_pas}PA'] = \
-            (pas_df.cumulH - pas_df.groupby('batter').cumulH.shift(significant_pas)).combine_first(pas_df.cumulH) \
+            (pas_df.cumulH - pas_df.groupby(group_by).cumulH.shift(significant_pas)).combine_first(pas_df.cumulH) \
                 .div(pas_df[f'PA_last_{significant_pas}PA'])
         pas_df[f'xH/PA_last_{significant_pas}PA'] = \
-            (pas_df.cumulxBA - pas_df.groupby('batter').cumulxBA.shift(significant_pas)).combine_first(pas_df.cumulxBA) \
+            (pas_df.cumulxBA - pas_df.groupby(group_by).cumulxBA.shift(significant_pas)).combine_first(pas_df.cumulxBA) \
                 .div(pas_df[f'statcast_PA_last_{significant_pas}PA'])
         # display(pas_df[pas_df.index.get_level_values('batter') == 660670])
         pas_df.drop([col for col in pas_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
         return pas_df.fillna(0).groupby(['game_date', 'game_pk', 'batter']).first()
 
-    def pitcher_per_bf_agg(self, significant_bfs = SIGNIFICANT_PAS):
+    def pitcher_per_bf_agg(self, split_cols: list[str] = [], significant_bfs = SIGNIFICANT_PAS):
+        group_by = ['pitcher'] + split_cols
         bfs_df = self.at_bats_df[self.at_bats_df.index.get_level_values('pitcher') != 0].fillna({'xBA': 0})
+        if len(split_cols) > 0:
+            bfs_df.set_index([col for col in split_cols if col in bfs_df.columns], append = True, inplace = True)
         bfs_df['BF'] = 1
         bfs_df['K'] = bfs_df.events.isin(['strikeout', 'strikeout_double_play'])
         bfs_df['BB'] = bfs_df.events.isin(['walk', 'hit_by_pitch'])
         # display(bfs_df[bfs_df.index.get_level_values('pitcher') == 457435])
         bfs_df = bfs_df.loc[:, ['BF', 'xBA', 'H', 'K', 'BB', 'statcast_tracked']].astype(float) \
-            .groupby('pitcher').cumsum() \
-                .groupby('pitcher').shift(1).fillna(0)
+            .groupby(group_by).cumsum() \
+                .groupby(group_by).shift(1).fillna(0)
         bfs_df.rename({col: 'cumulBF_statcast' if col == 'statcast_tracked' else f'cumul{col}' for col in bfs_df.columns}, axis = 1, inplace = True)
         bfs_df[f'BF_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulBF - bfs_df.groupby('pitcher').cumulBF.shift(significant_bfs)).combine_first(bfs_df.cumulBF).astype(int)
+            (bfs_df.cumulBF - bfs_df.groupby(group_by).cumulBF.shift(significant_bfs)).combine_first(bfs_df.cumulBF).astype(int)
         bfs_df[f'statcast_BF_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulBF_statcast - bfs_df.groupby('pitcher').cumulBF_statcast.shift(significant_bfs)).combine_first(bfs_df.cumulBF_statcast)
+            (bfs_df.cumulBF_statcast - bfs_df.groupby(group_by).cumulBF_statcast.shift(significant_bfs)).combine_first(bfs_df.cumulBF_statcast)
         bfs_df[f'K%_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulK - bfs_df.groupby('pitcher').cumulK.shift(significant_bfs)).combine_first(bfs_df.cumulK) \
+            (bfs_df.cumulK - bfs_df.groupby(group_by).cumulK.shift(significant_bfs)).combine_first(bfs_df.cumulK) \
                 .div(bfs_df[f'BF_last_{significant_bfs}BF'])
         bfs_df[f'BB%_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulBB - bfs_df.groupby('pitcher').cumulBB.shift(significant_bfs)).combine_first(bfs_df.cumulBB) \
+            (bfs_df.cumulBB - bfs_df.groupby(group_by).cumulBB.shift(significant_bfs)).combine_first(bfs_df.cumulBB) \
                 .div(bfs_df[f'BF_last_{significant_bfs}BF'])
         bfs_df[f'H/PA_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulH - bfs_df.groupby('pitcher').cumulH.shift(significant_bfs)).combine_first(bfs_df.cumulH) \
+            (bfs_df.cumulH - bfs_df.groupby(group_by).cumulH.shift(significant_bfs)).combine_first(bfs_df.cumulH) \
                 .div(bfs_df[f'BF_last_{significant_bfs}BF'])
         bfs_df[f'xH/PA_last_{significant_bfs}BF'] = \
-            (bfs_df.cumulxBA - bfs_df.groupby('pitcher').cumulxBA.shift(significant_bfs)).combine_first(bfs_df.cumulxBA) \
+            (bfs_df.cumulxBA - bfs_df.groupby(group_by).cumulxBA.shift(significant_bfs)).combine_first(bfs_df.cumulxBA) \
                 .div(bfs_df[f'statcast_BF_last_{significant_bfs}BF'])
         # display(bfs_df[bfs_df.index.get_level_values('pitcher') == 457435])
         bfs_df.drop([col for col in bfs_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
@@ -224,7 +238,7 @@ class BTSBatterClassifier:
         '''
 
         # Scale data https://stackoverflow.com/a/59164898
-        features_df = self.model_input_df.select_dtypes(include = 'float64')
+        features_df = self.model_input_df.drop('H', axis = 1)
         scaler = None
         if scale_features:
             scaler = StandardScaler().fit(features_df)
@@ -295,11 +309,16 @@ class BTSBatterClassifier:
         if streak > 0:
             streaks.append(streak)
 
+        title = ''
+        try:
+            title = self.clf.__str__()
+        except:
+            title = self.pkl_name
         plt.hist(streaks, bins = list(range(1, 58)))
         plt.title('\n'.join([
-            self.pkl_name,
-            f'Best Streak: {max(streaks) if len(streaks) > 0 else 0}',
-            f'{100 * round(top_two_picks_by_day_df.H.astype(bool).mean(), 2)}% Pick Accuracy'
+            title,
+            f'{100 * round(top_two_picks_by_day_df.H.astype(bool).mean(), 2)}% Pick Accuracy (assuming double-down every day)',
+            f'Best Streak: {max(streaks) if len(streaks) > 0 else 0}'
         ]))
         plt.show()
 

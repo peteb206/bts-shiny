@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Filter data to begin of 2 seasons ago
 now = datetime.now()
-print('Fetching data from DB...', end = '')
+print('Fetching and processing data from DB...', end = '')
 enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(now.year - 2, 1, 1))
 print(' complete after', round((datetime.now() - now).seconds, 1), 'seconds')
 

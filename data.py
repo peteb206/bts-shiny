@@ -242,52 +242,6 @@ class StatcastData(MLBData):
         'intent_walk', 'sac_bunt', 'sac_bunt_double_play', 'sac_fly', 'sac_fly_double_play', 'triple_play'
     ]
 
-    def __init__(self):
-        at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, dict(), projection = {'_id': False})
-
-        at_bats_df = at_bats_df.set_index(['game_pk', 'at_bat_number']) \
-            .merge(at_bats_df.groupby('events')['xBA'].median(), how = 'left', on = 'events', suffixes = ('', '_med')) \
-            .fillna({'xBA_med': 0})
-        at_bats_df['H'] = at_bats_df['events'] < 4
-        at_bats_df['BIP'] = at_bats_df['xBA_med'] > 0
-        at_bats_df.drop(['events', 'xBA_med'], axis = 1, inplace = True)
-
-        # Combine with other collections
-        ## At bat level
-        self.games_df: pd.DataFrame = find_pandas_all(__DB__.games, dict(), projection = {'_id': False})
-        self.at_bats_df = at_bats_df \
-            .merge(self.games_df[['game_pk', 'away_starter', 'home_starter', 'game_date']], on = 'game_pk') \
-            .sort_values(by = ['game_date', 'game_pk', 'home', 'at_bat'], ignore_index = True)
-        assert len(self.at_bats_df.index) == len(at_bats_df.index)
-        self.at_bats_df['starter'] = self.at_bats_df.apply(lambda row: row['pitcher'] in [row['away_starter'], row['home_starter']], axis = 1)
-        self.at_bats_df.drop(['away_starter', 'home_starter'], axis = 1, inplace = True)
-
-        ## Game level
-        self.games_df['year'] = self.games_df['game_date'].apply(lambda x: x.year)
-        lineup_slots_df: pd.DataFrame = find_pandas_all(__DB__.lineupSlots, dict(), projection = {'_id': False})
-        self.lineup_slots_df = lineup_slots_df \
-            .melt(id_vars = ['game_pk', 'lineup'], value_vars = ['away', 'home'], var_name = 'home', value_name = 'batter')
-        self.lineup_slots_df['home'] = self.lineup_slots_df['home'] == 'home'
-        batter_game_agg_df = self.batter_game_agg()
-        # TODO: use past year's HP-to-1B if none for this year
-        self.batter_games_df = batter_game_agg_df \
-            .merge(self.games_df, how = 'left', on = 'game_pk') \
-            .merge(self.lineup_slots_df, how = 'left', on = ['game_pk', 'batter', 'home']) \
-            .merge(find_pandas_all(__DB__.sprintSpeeds, dict(), projection = {'_id': False}), how = 'left', on = ['batter', 'year']) \
-            .sort_values(by = ['game_date', 'game_pk', 'home', 'lineup'], ignore_index = True)
-        self.batter_games_df['team'] = self.batter_games_df.apply(lambda row: row['home_team'] if row['home'] else row['away_team'], axis = 1)
-        self.batter_games_df['opponent'] = self.batter_games_df.apply(lambda row: row['away_team'] if row['home'] else row['home_team'], axis = 1)
-        self.batter_games_df['opp_starter'] = self.batter_games_df \
-            .apply(lambda row: row['away_starter'] if row['home'] else row['home_starter'], axis = 1)
-        assert len(self.batter_games_df.index) == len(batter_game_agg_df.index)
-        with open('models/hp_to_1b.pkl', 'rb') as pkl:
-            hp_to_1b_regression = pickle.load(pkl)
-            self.batter_games_df['rhb'] = self.batter_games_df['bats'] == 'R'
-            null_hp_to_1b = self.batter_games_df['hp_to_1b'].isna() & ~self.batter_games_df['speed'].isna()
-            self.batter_games_df.loc[null_hp_to_1b, 'hp_to_1b'] = hp_to_1b_regression \
-                .predict(self.batter_games_df.loc[null_hp_to_1b, ['rhb', 'speed']]).round(2)
-            self.batter_games_df.drop(['away_team', 'home_team', 'away_starter', 'home_starter', 'rhb', 'speed'], axis = 1, inplace = True)
-
     @staticmethod
     def get_statcast_csv(start_date = date(2023, 4, 1), end_date = date(2023, 4, 1)) -> pd.DataFrame:
         end_date = min(end_date, date.today() - timedelta(days = 1))
@@ -349,28 +303,6 @@ class StatcastData(MLBData):
         df = pd.read_csv(io.StringIO(baseball_savant_response.content.decode('utf-8')), usecols = ['player_id', 'hp_to_1b', 'sprint_speed'])
         df['year'] = year
         return df.rename({'player_id': 'batter', 'sprint_speed': 'speed'}, axis = 1)
-
-    def batter_game_agg(self) -> pd.DataFrame:
-        df = self.at_bats_df.copy()
-        df['PA'] = 1
-        agg_df = df.groupby(['game_pk', 'home', 'batter'])[['PA', 'xBA', 'H', 'BIP']].sum()
-        agg_df['HG'] = agg_df['H'] > 0
-        agg_df['xHG'] = agg_df['xBA'] >= 1
-        agg_df = agg_df.rename({'xBA': 'xH'}, axis = 1).reset_index()
-        agg_df = agg_df.merge(agg_df.groupby('game_pk')['xBA'].sum().reset_index(), how = 'left', on = 'game_pk', suffixes = ('', '_game_sum'))
-        agg_df['statcast_tracked'] = ~agg_df['xBA_game_sum'].isna()
-        return agg_df.drop('xBA_game_sum', axis = 1)
-
-    @staticmethod
-    def batter_span_agg(game_agg_df: pd.DataFrame):
-        agg_df = game_agg_df.groupby('batter')[['G', 'HG', 'xHG', 'PA', 'H', 'xH', 'BIP']].sum()
-        agg_df['H/PA'] = agg_df['H'] / agg_df['PA']
-        agg_df['xH/PA'] = agg_df['xH'] / agg_df['PA']
-        agg_df['H/G'] = agg_df['H'] / agg_df['G']
-        agg_df['xH/G'] = agg_df['xH'] / agg_df['G']
-        agg_df['H%'] = agg_df['HG'] / agg_df['G']
-        agg_df['xH%'] = agg_df['xHG'] / agg_df['G']
-        return agg_df[['G', 'PA', 'H/PA', 'xH/PA', 'H/G', 'xH/G', 'H%', 'xH%']].reset_index()
 
 if __name__ == '__main__':
     get_todays_batters()
