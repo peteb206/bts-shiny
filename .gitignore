@@ -1,5 +1,9 @@
-.env
+# Folders
 __pycache__/*
-ref/*
-test.ipynb
 .vscode/*
+rsconnect-python/*
+ref/*
+
+# Files
+MongoDB.txt
+test.ipynb

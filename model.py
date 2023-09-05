@@ -1,5 +1,5 @@
 # bts-shiny
-import data
+from data import get_todays_batters
 
 # third-party
 import pandas as pd
@@ -35,7 +35,7 @@ class BTSBatterClassifier:
     '''
     SIGNIFICANT_GAMES, MINIMUM_GAMES = 50, 25
     SIGNIFICANT_PAS, MINIMUM_PAS = 200, 100
-    PKL_DIR = '/Users/peteberryman/Desktop/bts-shiny/models'
+    PKL_DIR = './models'
 
     def __init__(self, clf, at_bats_df = pd.DataFrame(), pkl_name = ''):
         assert pkl_name != ''
@@ -323,7 +323,7 @@ class BTSBatterClassifier:
         plt.show()
 
     def todays_predictions(self):
-        todays_batters_df = data.get_todays_batters()
+        todays_batters_df = get_todays_batters()
         todays_batters_df = todays_batters_df.loc[todays_batters_df.opp_sp != 0]
         todays_batters_df = todays_batters_df.merge(self.at_bats_df.groupby('batter').hp_to_1b.last(), how = 'left', left_index = True,
                                                     right_index = True) # most recent time

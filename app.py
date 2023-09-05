@@ -28,7 +28,11 @@ app_ui = ui.page_fluid(
         div.shiny-data-grid-summary {{
             color: green;
         }}
+        div.card-header {{
+            background-color: green;
+        }}
         a.nav-link {{
+            background-color: {grey_hex};
             color: green !important;
         }}
         '''

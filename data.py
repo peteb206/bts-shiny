@@ -33,12 +33,16 @@ __SESSION__ = requests.Session()
 __SESSION__.headers.update(__SESSION_HEADERS__)
 
 # MongoDB
-if path.isfile('.env'):
-    with open('.env') as f:
-        for line in f.read().split('\n'):
-            x = line.split('=')
-            env[x[0]] = x[1]
+def get_mongodb_password():
+    file = 'MongoDB.txt'
+    if path.isfile(file):
+        with open(file) as f:
+            for line in f.read().split('\n'):
+                env['MONGODB_PASSWORD'] = line
+                print('Found MongoDB password in', file)
+                return
 
+get_mongodb_password()
 __DB__ = pymongo.MongoClient(f'mongodb+srv://peteb206:{env.get("MONGODB_PASSWORD")}@btscluster.tp9p0.mongodb.net').get_database('bts')
 
 __DB_SCHEMAS__ = {
@@ -170,7 +174,8 @@ def get_todays_batters() -> pd.DataFrame:
     # players_df.name = players_df.apply(lambda row: f'{row["name"]} ({row["handedness"]})', axis = 1)
 
     todays_batters_df = todays_batters_df \
-        .merge(players_df.loc[players_df.position != 'pitcher', ['id', 'feedId', 'squadId', 'name', 'handedness']], on = 'id')
+        .merge(players_df.loc[(players_df.status == 'active') & (players_df.position != 'pitcher'),
+                              ['id', 'feedId', 'squadId', 'name', 'handedness', 'status']], on = 'id')
 
     todays_batters_df['home'] = todays_batters_df.squadId == todays_batters_df.homeSquadId
     todays_batters_df['team'] = np.where(todays_batters_df.home, todays_batters_df.homeTeam, todays_batters_df.awayTeam)
