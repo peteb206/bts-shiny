@@ -7,7 +7,6 @@ import pickle
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 
 class BTSBatterClassifier:
     '''
@@ -291,6 +290,8 @@ class BTSBatterClassifier:
             self.__added_todays_batters_to_at_bats__ = True
 
     def simulate_results(self):
+        import matplotlib.pyplot as plt
+
         test_df = self.X_test.copy()
         test_df['H_prob'] = self.clf.predict_proba(test_df)[:, -1]
         test_df['H'] = self.y_test.copy()
@@ -317,9 +318,13 @@ class BTSBatterClassifier:
         plt.hist(streaks, bins = list(range(1, 58)))
         plt.title('\n'.join([
             title,
-            f'{100 * round(top_two_picks_by_day_df.H.astype(bool).mean(), 2)}% Pick Accuracy (assuming double-down every day)',
-            f'Best Streak: {max(streaks) if len(streaks) > 0 else 0}'
+            ' | '.join([
+                f'Tested on {len(top_two_picks_by_day_df.index.get_level_values("game_date").unique())} game days',
+                f'{100 * round(top_two_picks_by_day_df.H.astype(bool).mean(), 2)}% Pick Accuracy',
+                f'Best Streak: {max(streaks) if len(streaks) > 0 else 0}'
+            ])
         ]))
+        plt.xlabel('Streak Length\nNOTE: doubled down every day')
         plt.show()
 
     def todays_predictions(self):

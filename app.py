@@ -1,4 +1,5 @@
 from shiny import App, render, ui
+from shinyswatch.theme import spacelab as theme # https://bootswatch.com/
 from data import get_enhanced_at_bats
 from model import BTSBatterClassifier
 from datetime import datetime
@@ -10,50 +11,27 @@ enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(now.year - 2, 1, 1)
 print(' complete after', round((datetime.now() - now).seconds, 1), 'seconds')
 
 log_reg = BTSBatterClassifier(None, enhanced_at_bats, 'log_reg')
-
-grey_hex = '#D3D3D3'
+todays_predictions_df = log_reg.todays_predictions().query('`H%` >= 0.7')
 
 app_ui = ui.page_fluid(
-    ui.tags.style(
-        f'''
-        body {{
-            background-color: {grey_hex};
-        }}
-        div.card-body {{
-            background-color: {grey_hex};
-        }}
-        tbody {{
-            background-color: white;
-        }}
-        div.shiny-data-grid-summary {{
-            color: green;
-        }}
-        div.card-header {{
-            background-color: green;
-        }}
-        a.nav-link {{
-            background-color: {grey_hex};
-            color: green !important;
-        }}
-        '''
-    ),
-    # Reference this for adding JS (column widths, for example): https://shinylive.io/py/examples/#wordle
-    ui.h2('Beat the Streak', {'style': 'color: green;'}),
-    ui.navset_tab_card(
+    theme(),
+    ui.tags.script('''
+        $(document).ready(function() {
+            $('nav').toggleClass('bg-dark bg-primary');
+        });
+    '''),
+    ui.page_navbar(
         ui.nav(
-            'Home',
-            # ui.input_date(
-            #     'picksDate',
-            #     'Date:',
-            #     value = date.today(),
-            #     format='M d, yyyy'
-            # ),
-            ui.h3('Today\'s Picks', {'style': 'color: green;'}),
+            '', # 'Home',
+            # ui.input_date('picksDate', 'Date:', value = now.date(), max = now.date(), format = 'M d, yyyy'),
+            ui.h4(f'Picks for {now.strftime("%B")} {now.day}, {now.year}'),
             ui.output_data_frame('todays_picks')
         ),
-        # ui.nav('Player', '')
+        # ui.nav('Player', ''),
+        title = 'Beat the Streak Shiny App',
+        inverse = True
     ),
-    title = 'Beat the Streak Hub',
+    title = 'Beat the Streak Shiny App',
     lang = 'en'
 )
 
@@ -67,7 +45,6 @@ def server(input, output, session):
     @output
     @render.data_frame
     def todays_picks():
-        todays_predictions_df = log_reg.todays_predictions()
         df = todays_predictions_df.reset_index()
         df['game'] = df.apply(lambda row: f'{row["team"]} {"vs" if row["home"] else "@"} {row["opponent"]}', axis = 1)
         df['time'] = df.game_date.apply(lambda x: timestamp_to_str(x))
@@ -75,6 +52,6 @@ def server(input, output, session):
         df['H%'] = df['H%'].apply(lambda x: f'{round(x * 100, 1)}%')
         df = df[['name', 'H%', 'game', 'time', 'lineup', 'opp_sp_name']]
         df.columns = ['Batter', 'H%', 'Game', 'Time', 'Lineup', 'Opposing Starter']
-        return render.DataGrid(df, summary = 'Viewing Batters {start} to {end} of {total} | All times Central', row_selection_mode = 'none')
+        return render.DataGrid(df, summary = 'Viewing Batters {start} to {end} of {total} (>= 70%) | All times Central', row_selection_mode = 'none')
 
 app = App(app_ui, server)
