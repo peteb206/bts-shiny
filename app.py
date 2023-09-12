@@ -13,6 +13,42 @@ print(' complete after', round((datetime.now() - now).seconds, 1), 'seconds')
 log_reg = BTSBatterClassifier(None, enhanced_at_bats, 'log_reg')
 todays_predictions_df = log_reg.todays_predictions().query('`H%` >= 0.7')
 
+def timestamp_to_str(timestamp):
+    hour = str(timestamp.hour - (13 if timestamp.hour > 13 else 1))
+    minute = str(timestamp.minute) if timestamp.minute > 9 else f'0{timestamp.minute}'
+    am_pm = 'PM' if timestamp.hour > 12 else 'AM'
+    return f'{hour}:{minute} {am_pm}'
+
+def recommended_picks_ui():
+    recommendation = 'Skip today.'
+    todays_recommendations_df = todays_predictions_df.head(2).query('`H%` >= 0.75').reset_index()
+    cols = [
+        ui.div(
+            ui.row(
+                ui.column(
+                    3,
+                    ui.img(src = f'https://img.mlbstatic.com/mlb/images/players/head_shot/{row["batter"]}.jpg', width = '80px')
+                ),
+                ui.column(
+                    9,
+                    ui.row(ui.column(12, row['name'])),
+                    ui.row(ui.column(12, f'{round(row["H%"] * 100, 1)}%')),
+                    ui.row(ui.column(12, f'Lineup Slot: {"OUT" if row["lineup"] == 10 else "TBD" if row["lineup"] == 0 else row["lineup"]}')),
+                    ui.row(ui.column(12, f'{row["team"]} {"vs" if row["home"] else "@"} {row["opponent"]}')),
+                    ui.row(ui.column(12, timestamp_to_str(row['game_date'])))
+                )
+            )
+        ).add_class('col-6') for _, row in todays_recommendations_df.iterrows()
+    ]
+    if len(cols) == 2:
+        recommendation = f'Double down with {" and ".join(todays_recommendations_df.name.to_list())}.'
+    elif len(cols) == 1:
+        recommendation = f'Pick only {todays_recommendations_df.name.to_list()[0]}. No one else has a chance of 75% or higher to get a hit.'
+    return ui.div(
+        ui.row(ui.column(12, ui.strong('Recommendation: '), recommendation)).add_style('padding-bottom: 10px;'),
+        ui.row(*cols).add_style('padding-bottom: 10px; max-width: 750px;')
+    )
+
 app_ui = ui.page_fluid(
     theme(),
     ui.tags.script('''
@@ -24,9 +60,11 @@ app_ui = ui.page_fluid(
         ui.nav(
             '', # 'Home',
             # ui.input_date('picksDate', 'Date:', value = now.date(), max = now.date(), format = 'M d, yyyy'),
-            ui.h4(f'Picks for {now.strftime("%B")} {now.day}, {now.year}'),
+            ui.h4(f'{now.strftime("%B")} {now.day}, {now.year}'),
+            recommended_picks_ui(),
             ui.output_data_frame('todays_picks')
         ),
+        ui.nav_control(ui.a('MLB Play Link', href = 'https://www.mlb.com/apps/beat-the-streak/game', target = '_blank')),
         # ui.nav('Player', ''),
         title = 'Beat the Streak Shiny App',
         inverse = True
@@ -36,12 +74,6 @@ app_ui = ui.page_fluid(
 )
 
 def server(input, output, session):
-    def timestamp_to_str(timestamp):
-        hour = str(timestamp.hour - (13 if timestamp.hour > 13 else 1))
-        minute = str(timestamp.minute) if timestamp.minute > 9 else f'0{timestamp.minute}'
-        am_pm = 'PM' if timestamp.hour > 12 else 'AM'
-        return f'{hour}:{minute} {am_pm}'
-
     @output
     @render.data_frame
     def todays_picks():
