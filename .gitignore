@@ -7,3 +7,4 @@ ref/*
 # Files
 MongoDB.txt
 test.ipynb
+models/rf.pkl

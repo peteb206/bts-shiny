@@ -4,7 +4,9 @@ import numpy as np
 import io
 import requests
 import urllib.parse
+from bs4 import BeautifulSoup, Tag
 from datetime import date, timedelta, datetime
+import re
 import pymongo
 from pymongoarrow.api import find_pandas_all
 from os import path
@@ -50,10 +52,10 @@ __DB_SCHEMAS__ = {
         'game_pk': int, 'at_bat': int, 'batter': int, 'pitcher': int, 'xBA': float, 'home': bool, 'rhb': bool, 'rhp': bool, 'events': int
     },
     'games': {
-        'game_date': datetime, 'game_pk': int, 'away_team': str, 'home_team': str, 'away_starter': int, 'home_starter': int
+        'game_date': datetime, 'game_pk': int, 'away_team': str, 'home_team': str, 'away_starter': int, 'home_starter': int, 'park_factor': int
     },
-    'sprintSpeeds': {
-        'year': int, 'batter': int, 'hp_to_1b': float, 'speed': float, 'bats': str
+    'players': {
+        'year': int, 'playerId': int, 'hp_to_1b': float, 'speed': float, 'bats': str, 'throws': str
     }
 }
 
@@ -74,30 +76,32 @@ def update_db(year: int):
         [{k: v for k, v in row.items() if pd.notnull(v)} for row in new_at_bat_df[list(__DB_SCHEMAS__['atBats'].keys())].to_dict('records')]
     )
     print('Added', '{:,}'.format(len(new_at_bat_df.index)), 'at bats')
-    print('-' * 80)
 
-    # Sprint Speeds
+    # Players
     print('-' * 80)
-    print('Adding/Updating sprint speeds for the', year, 'season')
-    new_sprint_speeds_df = StatcastData.get_sprint_speed_csv(year) \
-        .merge(MLBData.get_stats_api_players(year).rename({'id': 'batter'}, axis = 1)[['batter', 'bats']], on = 'batter')
+    print('Adding/Updating players for the', year, 'season')
+    new_players_df = MLBData.get_stats_api_players(year).rename({'id': 'playerId'}, axis = 1)[['year', 'playerId', 'bats', 'throws']] \
+        .merge(StatcastData.get_sprint_speed_csv(year), how = 'outer', on = ['year', 'playerId'])
     # Delete existing entries
-    print('Deleted', __DB__.sprintSpeeds.delete_many({'year': year}).deleted_count, 'sprint speeds')
+    print('Deleted', '{:,}'.format(__DB__.players.delete_many({'year': year}).deleted_count), 'players')
     # Add new entries
-    __DB__.sprintSpeeds.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_sprint_speeds_df.to_dict('records')])
-    print('Added', len(new_sprint_speeds_df.index), 'sprint speeds')
-    print('-' * 80)
+    __DB__.players.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_players_df.to_dict('records')])
+    print('Added', '{:,}'.format(len(new_players_df.index)), 'players')
 
     # Games
+    print('-' * 80)
+    print('Adding/Updating games for the', year, 'season')
     game_pks = new_at_bat_df['game_pk'].unique().tolist()
-    print('-' * 50)
     game_dates_df = new_at_bat_df[['game_date', 'game_pk', 'away_team', 'home_team']].drop_duplicates().sort_values(by = ['game_date', 'game_pk'])
     starting_pitchers_df = new_at_bat_df.sort_values(['game_pk', 'home', 'at_bat']).groupby(['game_pk', 'home']).pitcher.first() \
         .reset_index().pivot(index = 'game_pk', columns = 'home')['pitcher'] \
         .rename({False: 'home_starter', True: 'away_starter'}, axis = 1).reset_index()
     games_df = game_dates_df.merge(starting_pitchers_df, on = 'game_pk')
+    games_df['park_factor'] = games_df.game_pk.map(MLBData.get_stats_api_game_venues(year)).map(StatcastData.get_park_factors(year))
+    # Delete existing entries
     print('Deleted', '{:,}'.format(__DB__.games.delete_many({'game_pk': {'$in': game_pks}}).deleted_count), 'games')
-    __DB__.games.insert_many(games_df.to_dict('records'))
+    # Add new entries
+    __DB__.games.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in games_df.to_dict('records')])
     print('Added', '{:,}'.format(len(games_df.index)), 'games')
 
 def month_start_and_end(year: int, month: int) -> tuple[date, date]:
@@ -109,23 +113,26 @@ def date_to_datetime(date: date) -> datetime:
 def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
     games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gte': from_date}}, projection = {'_id': False})
     at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
-    speed_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, {'year': {'$gte': from_date.year}}, projection = {'_id': False})
+    players_df: pd.DataFrame = find_pandas_all(__DB__.players, {'year': {'$gte': from_date.year}}, projection = {'_id': False})
 
     games_df.set_index('game_pk', inplace = True)
+    games_df.park_factor = games_df.park_factor.fillna(100).astype(int)
     at_bats_df.set_index(['game_pk', 'home', 'at_bat', 'batter', 'pitcher'], inplace = True)
     at_bats_df.sort_index(inplace = True)
-    speed_df.set_index(['year', 'batter'], inplace = True)
     # Starting pitcher
     at_bats_df = at_bats_df.merge(games_df, left_index = True, right_index = True)
     at_bats_df['team'] = np.where(at_bats_df.index.get_level_values('home'), at_bats_df.home_team, at_bats_df.away_team)
     at_bats_df['opponent'] = np.where(at_bats_df.index.get_level_values('home'), at_bats_df.away_team, at_bats_df.home_team)
     at_bats_df['opp_sp'] = np.where(at_bats_df.index.get_level_values('home'), at_bats_df.away_starter, at_bats_df.home_starter)
-    at_bats_df.set_index(['game_date', 'team', 'opponent'], append = True, inplace = True)
-    at_bats_df = at_bats_df.reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'at_bat', 'batter', 'pitcher'])
+    at_bats_df['year'] = at_bats_df.game_date.dt.year
+    at_bats_df.set_index(['year', 'game_date', 'team', 'opponent'], append = True, inplace = True)
 
-    # Speed
-    at_bats_df['year'] = pd.to_datetime(at_bats_df.index.get_level_values('game_date')).year
-    at_bats_df = at_bats_df.join(speed_df, how = 'left', on = ['year', 'batter'])
+    # Player data
+    players_df.set_index(['year', 'playerId'], inplace = True)
+    at_bats_df = at_bats_df \
+        .merge(players_df.rename_axis(index = {'playerId': 'batter'}).drop('throws', axis = 1), how = 'left', left_index = True, right_index = True) \
+            .merge(players_df.rename_axis(index = {'playerId': 'pitcher'})[['throws']], how = 'left', left_index = True, right_index = True) \
+                .droplevel('year')
     hp_to_1b_regression = pickle.load(open('models/hp_to_1b.pkl', 'rb'))
     null_hp_to_1b = at_bats_df['hp_to_1b'].isna() & ~at_bats_df['speed'].isna()
     at_bats_df.loc[null_hp_to_1b, 'hp_to_1b'] = hp_to_1b_regression.predict(at_bats_df.loc[null_hp_to_1b, ['rhb', 'speed']]).round(2)
@@ -136,7 +143,8 @@ def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
     lineups_df = lineups_df.set_index(['game_pk', 'home', 'batter'])[['lineup']]
     at_bats_df = at_bats_df \
         .merge(lineups_df.loc[lineups_df.lineup < 10], how = 'left', left_index = True, right_index = True) \
-            .reorder_levels(at_bats_df.index.names).sort_index()
+            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'at_bat', 'batter', 'pitcher']) \
+                .sort_index()
 
     # x stats calculations
     at_bats_df.events = at_bats_df.events.replace(dict(enumerate(StatcastData.__AT_BAT_FINAL_EVENTS__)))
@@ -147,18 +155,21 @@ def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
         .get_level_values('game_pk') \
             .map(at_bats_df.groupby('game_pk')['xBA'].sum() > 0)
     # print(at_bats_df.statcast_tracked.value_counts(normalize = True).mul(100).round(1)[True], '% of at bats were statcast tracked...', sep = '')
-    return at_bats_df.drop(['year', 'speed', 'away_team', 'home_team', 'away_starter', 'home_starter', 'xBA_med'], axis = 1)
-
+    return at_bats_df.drop(['speed', 'away_team', 'home_team', 'away_starter', 'home_starter', 'xBA_med'], axis = 1)
 
 def get_todays_batters() -> pd.DataFrame:
+    game_date = date.today()
     BTS_JSON_PATH = 'https://www.mlb.com/apps/beat-the-streak/game/json'
+    venues_dict = MLBData.get_stats_api_game_venues()
+    park_factors_dict = StatcastData.get_park_factors(game_date.year)
 
     games_df = pd.DataFrame(json.loads(get(f'{BTS_JSON_PATH}/units.json').text)['units'])
     games_df.lockDateTime = games_df.lockDateTime.apply(lambda x: datetime.strptime(x[:16], '%Y-%m-%dT%H:%M'))
     games_df = games_df.loc[
-        games_df.lockDateTime.apply(lambda x: x.date()) == date.today(),
+        games_df.lockDateTime.apply(lambda x: x.date()) == game_date,
         ['feedId', 'awaySquadId', 'homeSquadId', 'awayProbablePitcherId', 'homeProbablePitcherId', 'lockDateTime', 'lineups']
     ].rename({'feedId': 'game_pk'}, axis = 1)
+    games_df['park_factor'] = games_df.game_pk.map(venues_dict).map(park_factors_dict).fillna(100)
 
     teams_df = pd.DataFrame(json.loads(get(f'{BTS_JSON_PATH}/squads.json').text)['squads'])[['id', 'abbreviation']]
     games_df = games_df \
@@ -184,49 +195,33 @@ def get_todays_batters() -> pd.DataFrame:
 
     todays_batters_df = todays_batters_df \
         .merge(players_df[['id', 'feedId', 'name', 'handedness']], left_on = 'spId', right_on = 'id', suffixes = ('', '.sp')) \
-            .rename({'lockDateTime': 'game_date', 'feedId': 'batter', 'handedness': 'bats', 'feedId.sp': 'opp_sp', 'name.sp': 'opp_sp_name',
-                        'handedness.sp': 'opp_sp_throws'}, axis = 1)
+            .rename({'lockDateTime': 'game_time', 'feedId': 'batter', 'handedness': 'bats', 'feedId.sp': 'opp_sp', 'name.sp': 'opp_sp_name',
+                        'handedness.sp': 'throws'}, axis = 1)
 
-    todays_batters_df['team_lineup_set'] = todays_batters_df.team.map(todays_batters_df.groupby('team').lineup.max() > 0) # 0 = TBD, 10 = OUT
+    todays_batters_df = todays_batters_df \
+        .merge((todays_batters_df.groupby(['game_pk', 'team']).lineup.max() > 0).reset_index().rename({'lineup': 'team_lineup_set'}, axis = 1))
+    # 0 = TBD, 10 = OUT
     todays_batters_df.lineup = todays_batters_df \
         .apply(lambda row: int(row['lineup']) if row['lineup'] > 0 else 10 if row['team_lineup_set'] else 0, axis = 1)
+    todays_batters_df['game_date'] = date_to_datetime(game_date)
     todays_batters_df = todays_batters_df \
         .set_index(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
-            .loc[:, ['lineup', 'name', 'bats', 'opp_sp', 'opp_sp_name', 'opp_sp_throws']]
+            .loc[:, ['game_time', 'lineup', 'name', 'bats', 'opp_sp', 'opp_sp_name', 'throws', 'park_factor']]
     return todays_batters_df
 
 class MLBData:
-
     @staticmethod
-    def get_stats_api_games(year: int, date: date):
-        req = get(
-            'https://statsapi.mlb.com/api/v1/schedule?lang=en&sportId=1&gameType=R' \
-                + (f'&season={year}' if date == None else f'&date={date.strftime("%Y-%m-%d")}') \
-                + '&hydrate=team,probablePitcher,lineups' #,weather,linescore'
-        )
-        games_list = list()
-        for game_date in json.loads(req.text)['dates']:
-            for game in game_date['games']:
-                utc_hour, minute = int(game['gameDate'].split('T')[1].split(':')[0]), int(game['gameDate'].split('T')[1].split(':')[1])
-                hour = utc_hour - 5 if utc_hour > 5 else utc_hour + 19
-                games_list.append({
-                    'year': game['season'],
-                    'game_date': game_date['date'],
-                    'game_time': f'{hour if hour < 13 else hour - 12}:{"0" if minute < 10 else ""}{minute} {"PM" if hour > 11 else "AM"}',
-                    'game_pk': game['gamePk'],
-                    # 'away_team_id': game['teams']['away']['team']['id'],
-                    # 'home_team_id': game['teams']['home']['team']['id'],
-                    'away_team': game['teams']['away']['team']['abbreviation'],
-                    'home_team': game['teams']['home']['team']['abbreviation'],
-                    'away_starter': game['teams']['away']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['away'].keys() else None,
-                    'home_starter': game['teams']['home']['probablePitcher']['id'] if 'probablePitcher' in game['teams']['home'].keys() else None,
-                    'away_lineup': ([x['id'] for x in game['lineups']['awayPlayers']] if 'awayPlayers' in game['lineups'].keys() else []) \
-                        if 'lineups' in game.keys() else [],
-                    'home_lineup': ([x['id'] for x in game['lineups']['homePlayers']] if 'homePlayers' in game['lineups'].keys() else []) \
-                        if 'lineups' in game.keys() else [],
-                    'status': game['status']['detailedState']
-                })
-        return pd.DataFrame(games_list)
+    def get_stats_api_game_venues(year: int | None = None) -> dict[int, int]:
+        game_venue_dict = dict()
+        url = 'https://statsapi.mlb.com/api/v1/schedule?lang=en&sportId=1&gameType=R'
+        if year == None:
+            url += f'&date={date.today().strftime("%Y-%m-%d")}'
+        else:
+            url += f'&season={year}'
+        for game_dt in json.loads(get(url).text)['dates']:
+            for game in game_dt['games']:
+                game_venue_dict[game['gamePk']] = game['venue']['id']
+        return game_venue_dict
 
     @staticmethod
     def get_stats_api_players(year: int):
@@ -307,7 +302,27 @@ class StatcastData(MLBData):
         baseball_savant_response = get(url)
         df = pd.read_csv(io.StringIO(baseball_savant_response.content.decode('utf-8')), usecols = ['player_id', 'hp_to_1b', 'sprint_speed'])
         df['year'] = year
-        return df.rename({'player_id': 'batter', 'sprint_speed': 'speed'}, axis = 1)
+        return df.rename({'player_id': 'playerId', 'sprint_speed': 'speed'}, axis = 1)
+
+    @staticmethod
+    def get_park_factors(year: int) -> dict[int, float]:
+        venues_dict = dict()
+        baseball_savant_response = get('https://baseballsavant.mlb.com/leaderboard/statcast-park-factors?type=venue&stat=index_Hits')
+        soup = BeautifulSoup(baseball_savant_response.text, 'html.parser')
+        data_div = soup.find('div', {'class': 'article-template'})
+        if data_div != None:
+            script = data_div.find('script')
+            if isinstance(script, Tag):
+                search = re.search(r'var data = (\[.*\])', script.text)
+                if search != None:
+                    park_factors_json_str = search.group(1)
+                    park_factors_json = json.loads(park_factors_json_str)
+                    for park_dict in park_factors_json:
+                        venue_id = int(park_dict['venue_id'])
+                        park_factor = park_dict[f'metric_value_{year}']
+                        if isinstance(park_factor, str):
+                            venues_dict[venue_id] = int(park_factor)
+        return venues_dict
 
 if __name__ == '__main__':
     get_todays_batters()

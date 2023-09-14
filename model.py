@@ -11,21 +11,10 @@ from sklearn.decomposition import PCA
 class BTSBatterClassifier:
     '''
     # Example
-
-    ## Read data from MongoDB
-    games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gt': datetime(now.year - 2, 1, 1)}}, projection = {'_id': False})
-    at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
-    speed_df: pd.DataFrame = find_pandas_all(__DB__.sprintSpeeds, {'year': {'$gte': datetime.now().year}}, projection = {'_id': False})
-
-    games_df.set_index('game_pk', inplace = True)
-    at_bats_df.set_index(['game_pk', 'home', 'at_bat', 'batter', 'pitcher'], inplace = True)
-    at_bats_df.sort_index(inplace = True)
-    speed_df.set_index(['year', 'batter'], inplace = True)
-
-    ## Build classifier
-    enhanced_at_bats = enhance_at_bats(at_bats_df = at_bats_df, games_df = games_df, speed_df = speed_df)
-    log_reg = BTSBatterClassifier(LogisticRegressionCV(cv = 10, random_state = 57), at_bats_df, 'log_reg')
-    ### Fit classifier
+    ## Initialize classifier
+    enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(2015, 1, 1))
+    log_reg = BTSBatterClassifier(LogisticRegressionCV(cv = 10, random_state = 57), enhanced_at_bats, 'log_reg')
+    ### Fit
     log_reg.fit_model(scale_features = True, perform_pca = True)
     ### Simulate results on test data
     log_reg.simulate_results()
@@ -50,35 +39,45 @@ class BTSBatterClassifier:
     def build_model_input_df(self):
         game_days_df = self.at_bats_df \
             .groupby(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
-                .agg({'opp_sp': ['count', 'first'], 'H': max, 'hp_to_1b': 'first'}) #, 'bats': 'first', 'lineup': 'first'
+                .agg({'opp_sp': ['count', 'first'], 'H': max, 'hp_to_1b': 'first', 'park_factor': 'first', 'bats': 'first', 'throws': 'first'})
         game_days_df.columns = ['PA' if col[1] == 'count' else col[0] for col in game_days_df.columns]
-        game_days_df.set_index('opp_sp', append = True, inplace = True)
+        game_days_df['rhb'] = game_days_df.bats.eq('R') | (game_days_df.bats.eq('S') & game_days_df.throws.eq('L'))
+        game_days_df['rhp'] = game_days_df.throws.eq('R')
+        game_days_df.drop(['bats', 'throws'], axis = 1, inplace = True)
+        game_days_df.set_index(['rhb', 'opp_sp', 'rhp'], append = True, inplace = True)
 
+        batter_game_agg_df = self.batter_per_game_agg()
+        batter_game_agg_home_away_df = self.batter_per_game_agg(split_cols = ['home'])
+        batter_pa_agg_df = self.batter_per_pa_agg()
+        batter_pa_agg_p_hand_df = self.batter_per_pa_agg(split_cols = ['rhp'])
+        opp_pitcher_bf_agg_df = self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'})
+        opp_pitcher_bf_agg_b_hand_df = self.pitcher_per_bf_agg(split_cols = ['rhb']).rename_axis(index = {'pitcher': 'opp_sp'})
+        bullpen_bf_agg_df = self.bullpen_per_bf_agg()
+        batter_pa_agg_b_v_p_df = self.batter_per_pa_agg(split_cols = ['pitcher']).rename_axis(index = {'pitcher': 'opp_sp'})
+
+        # TODO: ensure proper merging... especially for handedness splits and BvP
         self.model_input_df = game_days_df \
-            .merge(self.batter_per_game_agg(), left_index = True, right_index = True) \
-                .merge(self.batter_per_game_agg(split_cols = ['home']), left_index = True, right_index = True, suffixes = ('', '_home_away')) \
-                    .merge(self.batter_per_pa_agg(), left_index = True, right_index = True) \
-                        .merge(self.batter_per_pa_agg(split_cols = ['rhp']), left_index = True, right_index = True, suffixes = ('', '_vs_hp')) \
-                            .merge(self.pitcher_per_bf_agg().rename_axis(index = {'pitcher': 'opp_sp'}), left_index = True, right_index = True) \
-                                .merge(self.pitcher_per_bf_agg(split_cols = ['rhb']).rename_axis(index = {'pitcher': 'opp_sp'}),
-                                       left_index = True, right_index = True, suffixes = ('', '_vs_hb')) \
-                                    .merge(self.bullpen_per_bf_agg(), left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
-                                        .merge(self.batter_per_pa_agg(split_cols = ['pitcher']), left_index = True, right_index = True,
-                                               suffixes = ('', '_vs_opp_sp')) \
-                                            .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
-                                                .sort_index() \
-                                                    .query(f'''
-                                                        PA >= 3 and G_last_{self.SIGNIFICANT_GAMES}G >= {self.MINIMUM_GAMES} and
-                                                        PA_last_{self.SIGNIFICANT_PAS}PA >= {self.MINIMUM_PAS} and
-                                                        BF_last_{self.SIGNIFICANT_PAS}BF >= {self.MINIMUM_PAS} and
-                                                        BF_last_{self.SIGNIFICANT_PAS}BF_bullpen >= {self.MINIMUM_PAS}
-                                                    '''.replace('\n', '')) \
-                                                        .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G',
-                                                               f'G_last_{self.SIGNIFICANT_GAMES}G_home_away', f'PA_last_{self.SIGNIFICANT_PAS}PA',
-                                                               f'PA_last_{self.SIGNIFICANT_PAS}PA_vs_hp', f'BF_last_{self.SIGNIFICANT_PAS}BF',
-                                                               f'BF_last_{self.SIGNIFICANT_PAS}BF_vs_hb',
-                                                               f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
-                                                            .dropna()
+            .merge(batter_game_agg_df, left_index = True, right_index = True) \
+                .merge(batter_game_agg_home_away_df, left_index = True, right_index = True, suffixes = ('', '_home_away')) \
+                    .merge(batter_pa_agg_df, left_index = True, right_index = True) \
+                        .merge(batter_pa_agg_p_hand_df, left_index = True, right_index = True, suffixes = ('', '_vs_hp')) \
+                            .merge(opp_pitcher_bf_agg_df, left_index = True, right_index = True) \
+                                .merge(opp_pitcher_bf_agg_b_hand_df, left_index = True, right_index = True, suffixes = ('', '_vs_hb')) \
+                                    .merge(bullpen_bf_agg_df, left_index = True, right_index = True, suffixes = ('', '_bullpen')) \
+                                        .merge(batter_pa_agg_b_v_p_df, left_index = True, right_index = True, suffixes = ('', '_vs_opp_sp')) \
+                                            .query(f'''
+                                                PA >= 3 and G_last_{self.SIGNIFICANT_GAMES}G >= {self.MINIMUM_GAMES} and
+                                                PA_last_{self.SIGNIFICANT_PAS}PA >= {self.MINIMUM_PAS} and
+                                                BF_last_{self.SIGNIFICANT_PAS}BF >= {self.MINIMUM_PAS} and
+                                                BF_last_{self.SIGNIFICANT_PAS}BF_bullpen >= {self.MINIMUM_PAS}
+                                            '''.replace('\n', '')) \
+                                                .drop(['PA', f'G_last_{self.SIGNIFICANT_GAMES}G', f'G_last_{self.SIGNIFICANT_GAMES}G_home_away',
+                                                       f'PA_last_{self.SIGNIFICANT_PAS}PA', f'PA_last_{self.SIGNIFICANT_PAS}PA_vs_hp',
+                                                       f'BF_last_{self.SIGNIFICANT_PAS}BF', f'BF_last_{self.SIGNIFICANT_PAS}BF_vs_hb',
+                                                       f'BF_last_{self.SIGNIFICANT_PAS}BF_bullpen'], axis = 1) \
+                                                    .droplevel(['rhb', 'rhp']) \
+                                                        .reorder_levels(['game_date', 'game_pk', 'home', 'team', 'opponent', 'opp_sp', 'batter']) \
+                                                            .dropna().sort_index()
 
     def batter_per_game_agg(self, split_cols: list[str] = [], significant_games = SIGNIFICANT_GAMES) -> pd.DataFrame:
         group_by = ['batter'] + split_cols
@@ -122,7 +121,7 @@ class BTSBatterClassifier:
         # display(batter_games_df[batter_games_df.index.isin([668804], level = 3)])
         batter_games_df.drop([col for col in batter_games_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))],
                              axis = 1, inplace = True)
-        return batter_games_df.fillna(0)
+        return batter_games_df.fillna(0).groupby(['game_date', 'batter'] + split_cols).first()
 
     def batter_per_pa_agg(self, split_cols: list[str] = [], significant_pas = SIGNIFICANT_PAS) -> pd.DataFrame:
         group_by = ['batter'] + split_cols
@@ -149,7 +148,7 @@ class BTSBatterClassifier:
                 .div(pas_df[f'statcast_PA_last_{significant_pas}PA'])
         # display(pas_df[pas_df.index.get_level_values('batter') == 660670])
         pas_df.drop([col for col in pas_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
-        return pas_df.fillna(0).groupby(['game_date', 'game_pk', 'batter']).first()
+        return pas_df.fillna(0).groupby(['game_date', 'batter'] + split_cols).first()
 
     def pitcher_per_bf_agg(self, split_cols: list[str] = [], significant_bfs = SIGNIFICANT_PAS):
         group_by = ['pitcher'] + split_cols
@@ -182,7 +181,7 @@ class BTSBatterClassifier:
                 .div(bfs_df[f'statcast_BF_last_{significant_bfs}BF'])
         # display(bfs_df[bfs_df.index.get_level_values('pitcher') == 457435])
         bfs_df.drop([col for col in bfs_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
-        return bfs_df.fillna(0).groupby(['game_date', 'game_pk', 'pitcher']).first()
+        return bfs_df.fillna(0).groupby(['game_date', 'pitcher'] + split_cols).first()
 
     def bullpen_per_bf_agg(self, significant_bfs = SIGNIFICANT_PAS):
         bfs_df = self.at_bats_df.loc[self.at_bats_df.opp_sp != self.at_bats_df.index.get_level_values('pitcher')].fillna({'xBA': 0})
@@ -212,7 +211,7 @@ class BTSBatterClassifier:
                 .div(bfs_df[f'statcast_BF_last_{significant_bfs}BF'])
         # display(bfs_df[bfs_df.index.get_level_values('opponent') == 'CHC'])
         bfs_df.drop([col for col in bfs_df.columns if (col.startswith('cumul')) | (col.startswith('statcast'))], axis = 1, inplace = True)
-        return bfs_df.fillna(0).groupby(['game_date', 'game_pk', 'opponent']).first()
+        return bfs_df.fillna(0).groupby(['game_date', 'opponent']).first()
 
     def fit_model(self, scale_features = True, perform_pca = False):
         self.build_model_input_df()
@@ -275,19 +274,20 @@ class BTSBatterClassifier:
 
     def __add_todays_batters_to_at_bats__(self, todays_batters_df: pd.DataFrame):
         # Add dummy at bats for today's hitters
-        if not self.__added_todays_batters_to_at_bats__:
-            for at_bat in range(1, 4):
-                todays_batters_at_bats_df = todays_batters_df.drop(['name', 'opp_sp_name'], axis = 1)
-                todays_batters_at_bats_df['at_bat'] = at_bat
-                todays_batters_at_bats_df['pitcher'] = todays_batters_at_bats_df.opp_sp if at_bat < 3 else 0
-                todays_batters_at_bats_df.set_index(['at_bat', 'pitcher'], append = True, inplace = True)
-                todays_batters_at_bats_df = todays_batters_at_bats_df.reorder_levels(self.at_bats_df.index.names)
-                todays_batters_at_bats_df[['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']] = \
-                    self.at_bats_df.tail(len(todays_batters_at_bats_df.index)) \
-                        .loc[:, ['bats', 'xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']]
-                todays_batters_at_bats_df = todays_batters_at_bats_df.astype(self.at_bats_df.dtypes)
-                self.at_bats_df = pd.concat([self.at_bats_df, todays_batters_at_bats_df])
-            self.__added_todays_batters_to_at_bats__ = True
+        if self.__added_todays_batters_to_at_bats__:
+            return
+        for at_bat in range(1, 4):
+            todays_batters_at_bats_df = todays_batters_df.drop(['name', 'opp_sp_name', 'game_time'], axis = 1)
+            todays_batters_at_bats_df['at_bat'] = at_bat
+            todays_batters_at_bats_df['pitcher'] = todays_batters_at_bats_df.opp_sp if at_bat < 3 else 0
+            todays_batters_at_bats_df.set_index(['at_bat', 'pitcher'], append = True, inplace = True)
+            todays_batters_at_bats_df = todays_batters_at_bats_df.reorder_levels(self.at_bats_df.index.names)
+            todays_batters_at_bats_df[['xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']] = \
+                self.at_bats_df.tail(len(todays_batters_at_bats_df.index)) \
+                    .loc[:, ['xBA', 'events', 'rhb', 'rhp', 'H', 'BIP', 'statcast_tracked']]
+            todays_batters_at_bats_df = todays_batters_at_bats_df.astype(self.at_bats_df.dtypes)
+            self.at_bats_df = pd.concat([self.at_bats_df, todays_batters_at_bats_df])
+        self.__added_todays_batters_to_at_bats__ = True
 
     def simulate_results(self):
         import matplotlib.pyplot as plt
@@ -349,3 +349,18 @@ class BTSBatterClassifier:
         todays_options_df.reset_index(level = 'opp_sp', drop = True, inplace = True)
         todays_options_df.loc[:, 'H%'] = clf.predict_proba(todays_options_df)[:, -1]
         return todays_batters_df.merge(todays_options_df[['H%']], left_index = True, right_index = True).sort_values(by = 'H%', ascending = False)
+
+if __name__ == '__main__':
+    # Example
+    from data import get_enhanced_at_bats
+    from datetime import datetime
+    from sklearn.linear_model import LogisticRegressionCV
+    ## Initialize classifier
+    enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(2023, 1, 1))
+    log_reg = BTSBatterClassifier(LogisticRegressionCV(cv = 10, random_state = 57), enhanced_at_bats, 'test')
+    ### Fit
+    log_reg.fit_model(scale_features = True, perform_pca = True)
+    ### Simulate results on test data
+    # log_reg.simulate_results()
+    ### Get predictions for today
+    log_reg.todays_predictions()
