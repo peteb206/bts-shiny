@@ -3,7 +3,8 @@ from shinyswatch.theme import spacelab as theme # https://bootswatch.com/
 from pathlib import Path
 from data import get_enhanced_at_bats
 from model import BTSBatterClassifier
-from datetime import datetime, date
+import pandas as pd
+from datetime import datetime, date, timedelta
 
 # Filter data to begin of 2 seasons ago
 now = datetime.now()
@@ -11,10 +12,25 @@ print('Fetching and processing data from DB...', end = '')
 enhanced_at_bats = get_enhanced_at_bats(from_date = datetime(now.year - 1, 1, 1))
 print(' complete after', round((datetime.now() - now).seconds, 1), 'seconds')
 
+# Date picker
+game_dts: list[date] = [game_dt.date() for game_dt in enhanced_at_bats.index.get_level_values('game_date').unique() if game_dt.year == now.year]
+min_game_dt, max_game_dt, disabled_dts = min(game_dts), max(game_dts), list()
+# game_dt = min_game_dt
+# while game_dt < max_game_dt:
+#     if game_dt not in game_dts:
+#         disabled_dts.append(game_dt.strftime('%Y-%m-%d'))
+#     game_dt += timedelta(days = 1)
+
+# Classifier
 classifier = BTSBatterClassifier(None, enhanced_at_bats, 'log_reg')
 
 game_date = now.date()
 todays_predictions_df = classifier.todays_predictions(game_date)#.query('`H%` >= 0.7')
+if len(todays_predictions_df.index) > 0:
+    max_game_dt = game_date
+else:
+    game_date = max_game_dt
+    todays_predictions_df = classifier.todays_predictions(game_date)
 
 def timestamp_to_str(timestamp):
     hour = str(timestamp.hour - (13 if timestamp.hour > 13 else 1))
@@ -34,8 +50,11 @@ app_ui = ui.page_fluid(
             '', # 'Home',
             ui.row(
                 ui.column(4, ui.strong('Recommendations for')).add_style('width: 202px; padding-top: 5px;'),
-                ui.column(4, ui.input_date('date', '', value = now.date(), min = date(now.year, 3, 1), max = now.date(), format = 'M d, yyyy')) \
-                    .add_style('width: 150px;'),
+                ui.column(
+                    4,
+                    ui.input_date('date', '', value = max_game_dt, min = min_game_dt, max = max_game_dt, datesdisabled = disabled_dts,
+                                  format = 'M d, yyyy')
+                ).add_style('width: 150px;'),
                 ui.column(4, ui.output_ui('make_picks_button')).add_style('width: 114px;')
             ),
             ui.output_ui('recommendations').add_style('padding-bottom: 10px;'),
@@ -63,7 +82,11 @@ def server(input: Inputs, output: Outputs, session: Session):
     @output
     @render.ui
     def recommendations():
-        todays_recommendations_df = updated_predictions().head(2).query('`H%` >= 0.75').reset_index()
+        todays_recommendations_df = updated_predictions()
+        if len(todays_recommendations_df.index) == 0:
+            return ui.div()
+        else:
+            todays_recommendations_df = todays_predictions_df.head(2).query('`H%` >= 0.75').reset_index()
         cols = [
             ui.div(
                 ui.row(
@@ -103,6 +126,8 @@ def server(input: Inputs, output: Outputs, session: Session):
     @render.data_frame
     def picks_dataframe():
         df = updated_predictions().reset_index()
+        if len(df.index) == 0:
+            return render.DataGrid(pd.DataFrame())
         df['game'] = df.apply(lambda row: f'{row["team"]} {"vs" if row["home"] else "@"} {row["opponent"]}', axis = 1)
         df.lineup = df.lineup.apply(lambda x: 'OUT' if x == 10 else 'TBD' if x == 0 else str(int(x)))
         df['H%'] = df['H%'].apply(lambda x: f'{round(x * 100, 1)}%')

@@ -347,6 +347,9 @@ class BTSBatterClassifier:
         todays_options_df = todays_batters_df.loc[:, ['name', 'lineup', 'opp_sp_name']] \
             .merge(self.model_input_df, left_index = True, right_index = True)
 
+        if len(todays_options_df.index) == 0:
+            return pd.DataFrame()
+
         scaler, pca, clf = pickle.load(open(f'{self.PKL_DIR}/{self.pkl_name}.pkl', 'rb'))
         if scaler != None:
             todays_options_df = pd.DataFrame(scaler.transform(todays_options_df.loc[:, scaler.feature_names_in_]), index = todays_options_df.index,
