@@ -80,8 +80,9 @@ def update_db(year: int):
     # Players
     print('-' * 80)
     print('Adding/Updating players for the', year, 'season')
-    new_players_df = MLBData.get_stats_api_players(year).rename({'id': 'playerId'}, axis = 1)[['year', 'playerId', 'bats', 'throws']] \
-        .merge(StatcastData.get_sprint_speed_csv(year), how = 'outer', on = ['year', 'playerId'])
+    new_players_df = MLBData.get_stats_api_players(year).rename({'id': 'playerId', 'fullName': 'name'}, axis = 1) \
+        .loc[:, ['year', 'playerId', 'name', 'bats', 'throws']] \
+            .merge(StatcastData.get_sprint_speed_csv(year), how = 'outer', on = ['year', 'playerId'])
     # Delete existing entries
     print('Deleted', '{:,}'.format(__DB__.players.delete_many({'year': year}).deleted_count), 'players')
     # Add new entries
