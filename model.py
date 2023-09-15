@@ -1,8 +1,9 @@
 # bts-shiny
-from data import get_todays_batters
+from data import get_todays_batters, date_to_datetime
 
 # third-party
 import pandas as pd
+from datetime import date
 import pickle
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -277,7 +278,7 @@ class BTSBatterClassifier:
         if self.__added_todays_batters_to_at_bats__:
             return
         for at_bat in range(1, 4):
-            todays_batters_at_bats_df = todays_batters_df.drop(['name', 'opp_sp_name', 'game_time'], axis = 1)
+            todays_batters_at_bats_df = todays_batters_df.drop('game_time', axis = 1)
             todays_batters_at_bats_df['at_bat'] = at_bat
             todays_batters_at_bats_df['pitcher'] = todays_batters_at_bats_df.opp_sp if at_bat < 3 else 0
             todays_batters_at_bats_df.set_index(['at_bat', 'pitcher'], append = True, inplace = True)
@@ -327,16 +328,23 @@ class BTSBatterClassifier:
         plt.xlabel('Streak Length\nNOTE: doubled down every day')
         plt.show()
 
-    def todays_predictions(self):
-        todays_batters_df = get_todays_batters()
-        todays_batters_df = todays_batters_df.loc[todays_batters_df.opp_sp != 0]
-        todays_batters_df = todays_batters_df.merge(self.at_bats_df.groupby('batter').hp_to_1b.last(), how = 'left', left_index = True,
-                                                    right_index = True) # most recent time
+    def todays_predictions(self, game_date = date.today()):
+        is_today, todays_batters_df = game_date == date.today(), pd.DataFrame()
+        if is_today:
+            todays_batters_df = get_todays_batters()
+            todays_batters_df = todays_batters_df.loc[todays_batters_df.opp_sp != 0]
+            todays_batters_df = todays_batters_df.merge(self.at_bats_df.groupby('batter').hp_to_1b.last(), how = 'left', left_index = True,
+                                                        right_index = True) # most recent time
+            self.__add_todays_batters_to_at_bats__(todays_batters_df)
+        else:
+            todays_batters_df = self.at_bats_df.loc[(self.at_bats_df.index.get_level_values('game_date') == date_to_datetime(game_date)) & \
+                                                    ~self.at_bats_df.lineup.isna()] \
+                .groupby(['game_date', 'game_pk', 'home', 'team', 'opponent', 'batter']) \
+                    .agg({'name': 'first', 'lineup': 'first', 'opp_sp_name': 'first', 'H': sum})
 
-        self.__add_todays_batters_to_at_bats__(todays_batters_df)
         self.build_model_input_df()
 
-        todays_options_df = todays_batters_df.loc[:, ['name', 'lineup', 'opp_sp_name',]] \
+        todays_options_df = todays_batters_df.loc[:, ['name', 'lineup', 'opp_sp_name']] \
             .merge(self.model_input_df, left_index = True, right_index = True)
 
         scaler, pca, clf = pickle.load(open(f'{self.PKL_DIR}/{self.pkl_name}.pkl', 'rb'))

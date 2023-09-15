@@ -132,14 +132,15 @@ def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
     players_df.set_index(['year', 'playerId'], inplace = True)
     at_bats_df = at_bats_df \
         .merge(players_df.rename_axis(index = {'playerId': 'batter'}).drop('throws', axis = 1), how = 'left', left_index = True, right_index = True) \
-            .merge(players_df.rename_axis(index = {'playerId': 'pitcher'})[['throws']], how = 'left', left_index = True, right_index = True) \
+            .merge(players_df.rename_axis(index = {'playerId': 'pitcher'}).rename({'name': 'opp_sp_name'}, axis = 1)[['throws', 'opp_sp_name']],
+                   how = 'left', left_index = True, right_index = True) \
                 .droplevel('year')
     hp_to_1b_regression = pickle.load(open('models/hp_to_1b.pkl', 'rb'))
     null_hp_to_1b = at_bats_df['hp_to_1b'].isna() & ~at_bats_df['speed'].isna()
     at_bats_df.loc[null_hp_to_1b, 'hp_to_1b'] = hp_to_1b_regression.predict(at_bats_df.loc[null_hp_to_1b, ['rhb', 'speed']]).round(2)
 
     # Lineups
-    lineups_df = at_bats_df.reset_index().drop_duplicates(subset = ['game_pk', 'batter'])
+    lineups_df = at_bats_df.reset_index().sort_values(by = ['game_pk', 'at_bat']).drop_duplicates(subset = ['game_pk', 'batter'])
     lineups_df['lineup'] = lineups_df.groupby(['game_pk', 'home']).cumcount() + 1
     lineups_df = lineups_df.set_index(['game_pk', 'home', 'batter'])[['lineup']]
     at_bats_df = at_bats_df \
