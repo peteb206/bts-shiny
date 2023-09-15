@@ -1,5 +1,6 @@
 from shiny import App, Inputs, Outputs, Session, ui, render, reactive
 from shinyswatch.theme import spacelab as theme # https://bootswatch.com/
+from pathlib import Path
 from data import get_enhanced_at_bats
 from model import BTSBatterClassifier
 from datetime import datetime, date
@@ -31,12 +32,16 @@ app_ui = ui.page_fluid(
     ui.page_navbar(
         ui.nav(
             '', # 'Home',
-            ui.input_date('date', 'Date:', value = now.date(), min = date(now.year, 3, 1), max = now.date(), format = 'M d, yyyy'),
-            # ui.h4(f'{now.strftime("%B")} {now.day}, {now.year}'),
-            ui.output_ui('recommendations'),
+            ui.row(
+                ui.column(4, ui.strong('Recommendations for')).add_style('width: 202px; padding-top: 5px;'),
+                ui.column(4, ui.input_date('date', '', value = now.date(), min = date(now.year, 3, 1), max = now.date(), format = 'M d, yyyy')) \
+                    .add_style('width: 150px;'),
+                ui.column(4, ui.output_ui('make_picks_button')).add_style('width: 114px;')
+            ),
+            ui.output_ui('recommendations').add_style('padding-bottom: 10px;'),
             ui.output_data_frame('picks_dataframe')
         ),
-        ui.nav_control(ui.a('MLB Play Link', href = 'https://www.mlb.com/apps/beat-the-streak/game', target = '_blank')),
+        ui.nav_control(ui.a(ui.output_ui('github_logo'), href = 'https://github.com/peteb206/bts-shiny', target = '_blank')),
         # ui.nav('Player', ''),
         title = 'Beat the Streak Shiny App',
         inverse = True
@@ -48,9 +53,10 @@ app_ui = ui.page_fluid(
 def server(input: Inputs, output: Outputs, session: Session):
     @reactive.Calc
     def updated_predictions():
+        new_game_date = input.date()
         global game_date, todays_predictions_df
-        if game_date != input.date():
-            game_date = input.date()
+        if game_date != new_game_date:
+            game_date = new_game_date
             todays_predictions_df = classifier.todays_predictions(game_date)
         return todays_predictions_df
 
@@ -89,7 +95,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         else:
             recommendation = 'No games today.'
         return ui.div(
-            ui.row(ui.column(12, ui.strong(f'Recommendation for {game_date.strftime("%B")} {game_date.day}, {game_date.year}'), ui.br(), recommendation)).add_style('padding-bottom: 10px;'),
+            ui.p(recommendation).add_style('padding-bottom: 10px;'),
             ui.row(*cols).add_style('padding-bottom: 10px; max-width: 750px;')
         )
 
@@ -109,4 +115,20 @@ def server(input: Inputs, output: Outputs, session: Session):
             df.columns = ['Batter', 'H%', 'Game', 'Time (CDT)', 'Lineup', 'Opposing Starter']
         return render.DataGrid(df, summary = 'Viewing Batters {start} to {end} of {total}', row_selection_mode = 'none')
 
-app = App(app_ui, server)
+    @output
+    @render.ui
+    def make_picks_button():
+        if input.date() == date.today():
+            return ui.a(
+                ui.span('Make Picks').add_class('btn btn-success btn-sm'),
+                href = 'https://www.mlb.com/apps/beat-the-streak/game', target = '_blank'
+            ).add_style('margin-bottom: 10px;')
+        return ''
+
+    @output
+    @render.ui
+    def github_logo():
+        return ui.img(src = 'img/github.svg', style = 'height: 25px;')
+
+www_dir = Path(__file__).parent / 'www'
+app = App(app_ui, server, static_assets = www_dir)

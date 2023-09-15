@@ -41,7 +41,7 @@ def get_mongodb_password():
         with open(file) as f:
             for line in f.read().split('\n'):
                 env['MONGODB_PASSWORD'] = line
-                print('Found MongoDB password in', file)
+                # print('Found MongoDB password in', file)
                 return
 
 get_mongodb_password()
