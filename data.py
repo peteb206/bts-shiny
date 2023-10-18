@@ -45,7 +45,7 @@ def get_mongodb_password():
                 return
 
 get_mongodb_password()
-__DB__ = pymongo.MongoClient(f'mongodb+srv://peteb206:{env.get("MONGODB_PASSWORD")}@btscluster.tp9p0.mongodb.net').get_database('bts')
+__MONGO_CLIENT__ = pymongo.MongoClient(f'mongodb+srv://peteb206:{env.get("MONGODB_PASSWORD")}@btscluster.tp9p0.mongodb.net')
 
 __DB_SCHEMAS__ = {
     'atBats': {
@@ -60,6 +60,9 @@ __DB_SCHEMAS__ = {
 }
 
 def update_db(year: int):
+    #-----------------------#
+    #--------- Raw ---------#
+    #-----------------------#
     # At Bats
     start_date = date(year, 7 if year == 2020 else 3, 23)
     end_date = min(date(year, 10, 6), date.today() - timedelta(days = 1))
@@ -68,11 +71,11 @@ def update_db(year: int):
     new_at_bat_df = StatcastData.get_statcast_csv(start_date = start_date, end_date = end_date) \
         .sort_values(by = ['game_pk', 'at_bat'], ignore_index = True)
     # Delete existing entries
-    deleted_count = __DB__.atBats.delete_many({'game_pk': {'$in': new_at_bat_df['game_pk'].unique().tolist()}}).deleted_count
+    deleted_count = __MONGO_CLIENT__.raw.atBats.delete_many({'game_pk': {'$in': new_at_bat_df['game_pk'].unique().tolist()}}).deleted_count
     print('Deleted', '{:,}'.format(deleted_count), 'at bats')
     # Add new entries
     new_at_bat_df['game_date'] = new_at_bat_df['game_date'].apply(lambda x: date_to_datetime(x))
-    __DB__.atBats.insert_many(
+    __MONGO_CLIENT__.raw.atBats.insert_many(
         [{k: v for k, v in row.items() if pd.notnull(v)} for row in new_at_bat_df[list(__DB_SCHEMAS__['atBats'].keys())].to_dict('records')]
     )
     print('Added', '{:,}'.format(len(new_at_bat_df.index)), 'at bats')
@@ -84,9 +87,9 @@ def update_db(year: int):
         .loc[:, ['year', 'playerId', 'name', 'bats', 'throws']] \
             .merge(StatcastData.get_sprint_speed_csv(year), how = 'outer', on = ['year', 'playerId'])
     # Delete existing entries
-    print('Deleted', '{:,}'.format(__DB__.players.delete_many({'year': year}).deleted_count), 'players')
+    print('Deleted', '{:,}'.format(__MONGO_CLIENT__.raw.players.delete_many({'year': year}).deleted_count), 'players')
     # Add new entries
-    __DB__.players.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_players_df.to_dict('records')])
+    __MONGO_CLIENT__.raw.players.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in new_players_df.to_dict('records')])
     print('Added', '{:,}'.format(len(new_players_df.index)), 'players')
 
     # Games
@@ -100,10 +103,14 @@ def update_db(year: int):
     games_df = game_dates_df.merge(starting_pitchers_df, on = 'game_pk')
     games_df['park_factor'] = games_df.game_pk.map(MLBData.get_stats_api_game_venues(year)).map(StatcastData.get_park_factors(year))
     # Delete existing entries
-    print('Deleted', '{:,}'.format(__DB__.games.delete_many({'game_pk': {'$in': game_pks}}).deleted_count), 'games')
+    print('Deleted', '{:,}'.format(__MONGO_CLIENT__.raw.games.delete_many({'game_pk': {'$in': game_pks}}).deleted_count), 'games')
     # Add new entries
-    __DB__.games.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in games_df.to_dict('records')])
+    __MONGO_CLIENT__.raw.games.insert_many([{k: v for k, v in row.items() if pd.notnull(v)} for row in games_df.to_dict('records')])
     print('Added', '{:,}'.format(len(games_df.index)), 'games')
+
+    #-----------------------#
+    #----- Aggregation -----#
+    #-----------------------#
 
 def month_start_and_end(year: int, month: int) -> tuple[date, date]:
     return date(year = year, month = month, day = 1), date(year = year, month = month + 1, day = 1) - timedelta(days = 1)
@@ -112,9 +119,10 @@ def date_to_datetime(date: date) -> datetime:
     return datetime.combine(date, datetime.min.time())
 
 def get_enhanced_at_bats(from_date: date | datetime) -> pd.DataFrame:
-    games_df: pd.DataFrame = find_pandas_all(__DB__.games, {'game_date': {'$gte': from_date}}, projection = {'_id': False})
-    at_bats_df: pd.DataFrame = find_pandas_all(__DB__.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}}, projection = {'_id': False})
-    players_df: pd.DataFrame = find_pandas_all(__DB__.players, {'year': {'$gte': from_date.year}}, projection = {'_id': False})
+    games_df: pd.DataFrame = find_pandas_all(__MONGO_CLIENT__.raw.games, {'game_date': {'$gte': from_date}}, projection = {'_id': False})
+    at_bats_df: pd.DataFrame = find_pandas_all(__MONGO_CLIENT__.raw.atBats, {'game_pk': {'$in': games_df.game_pk.unique().tolist()}},
+                                               projection = {'_id': False})
+    players_df: pd.DataFrame = find_pandas_all(__MONGO_CLIENT__.raw.players, {'year': {'$gte': from_date.year}}, projection = {'_id': False})
 
     games_df.set_index('game_pk', inplace = True)
     games_df.park_factor = games_df.park_factor.fillna(100).astype(int)
